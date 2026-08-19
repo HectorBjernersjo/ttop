@@ -1,4 +1,4 @@
-//! prem — vad äter mitt RAM, per tmux-session.
+//! tmem — vad äter mitt RAM, per tmux-session.
 //!
 //! Grupperar alla processer per tmux-session (sessioner sorterade på total
 //! minnesanvändning), och inom varje session per processtyp. Processer

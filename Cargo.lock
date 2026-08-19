@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "prem"
+name = "tmem"
 version = "0.1.0"
