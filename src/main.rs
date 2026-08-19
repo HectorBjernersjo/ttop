@@ -1,8 +1,9 @@
 //! prem — vad äter mitt RAM, per tmux-session.
 //!
 //! Grupperar alla processer per tmux-session (sessioner sorterade på total
-//! minnesanvändning), och inom varje session per processtyp (comm).
-//! Processer utanför tmux hamnar i en egen hink.
+//! minnesanvändning), och inom varje session per processtyp. Processer
+//! utanför tmux hamnar i en egen hink. Default beskärs outputen till det
+//! som faktiskt förklarar minnesanvändningen; `--all` visar allt.
 //!
 //! Minnesmått: PSS från /proc/<pid>/smaps_rollup när det går att läsa
 //! (delade sidor räknas proportionellt, så summorna går ihop), annars RSS.
@@ -12,71 +13,221 @@
 //! daemons (t.ex. MSBuild-noder med PPID 1) som annars ser sessionslösa ut.
 
 use std::collections::HashMap;
+use std::env;
 use std::fs;
+use std::io::IsTerminal;
 use std::process::Command;
 
 const OUTSIDE: &str = "[utanför tmux]";
+const BAR_WIDTH: usize = 20;
+const MAX_ROWS_PER_SESSION: usize = 6;
 
 struct Proc {
     pid: u32,
     ppid: u32,
-    comm: String,
+    name: String,
     mem: u64, // bytes
     pss: bool,
     tmux_pane_env: Option<String>, // "%194"
 }
 
+struct Row {
+    name: String,
+    count: u32,
+    bytes: u64,
+}
+
+struct Session {
+    name: String,
+    rows: Vec<Row>,
+    total: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Paint {
+    on: bool,
+}
+
+impl Paint {
+    const BOLD: &'static str = "1";
+    const DIM: &'static str = "2";
+    const RED: &'static str = "31";
+    const GREEN: &'static str = "32";
+    const YELLOW: &'static str = "33";
+
+    fn w(self, code: &str, s: &str) -> String {
+        if self.on {
+            format!("\x1b[{code}m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
+    }
+}
+
 fn main() {
+    let all = env::args().skip(1).any(|a| a == "-a" || a == "--all");
+    let paint = Paint {
+        on: std::io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
+    };
+
     let procs = read_procs();
     let (pane_pid_to_session, pane_id_to_session) = tmux_panes();
-
     let ppid: HashMap<u32, u32> = procs.iter().map(|p| (p.pid, p.ppid)).collect();
 
-    // session -> comm -> (antal, bytes)
-    let mut sessions: HashMap<String, HashMap<String, (u32, u64)>> = HashMap::new();
+    // session -> processtyp -> (antal, bytes)
+    let mut by_session: HashMap<String, HashMap<String, (u32, u64)>> = HashMap::new();
     let mut any_rss_fallback = false;
-
     for p in &procs {
         if p.mem == 0 {
             continue; // kärntrådar m.m.
         }
         any_rss_fallback |= !p.pss;
         let session = session_of(p, &ppid, &pane_pid_to_session, &pane_id_to_session);
-        let entry = sessions
+        let e = by_session
             .entry(session)
             .or_default()
-            .entry(p.comm.clone())
+            .entry(p.name.clone())
             .or_insert((0, 0));
-        entry.0 += 1;
-        entry.1 += p.mem;
+        e.0 += 1;
+        e.1 += p.mem;
     }
 
-    print_meminfo_header();
-
-    let mut ordered: Vec<(String, Vec<(String, u32, u64)>, u64)> = sessions
+    let mut sessions: Vec<Session> = by_session
         .into_iter()
-        .map(|(name, comms)| {
-            let mut rows: Vec<(String, u32, u64)> =
-                comms.into_iter().map(|(c, (n, b))| (c, n, b)).collect();
-            rows.sort_by(|a, b| b.2.cmp(&a.2));
-            let total = rows.iter().map(|r| r.2).sum();
-            (name, rows, total)
+        .map(|(name, types)| {
+            let mut rows: Vec<Row> = types
+                .into_iter()
+                .map(|(name, (count, bytes))| Row { name, count, bytes })
+                .collect();
+            rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+            let total = rows.iter().map(|r| r.bytes).sum();
+            Session { name, rows, total }
         })
         .collect();
-    ordered.sort_by(|a, b| b.2.cmp(&a.2));
+    sessions.sort_by(|a, b| b.total.cmp(&a.total));
+    let grand: u64 = sessions.iter().map(|s| s.total).sum();
 
-    for (name, rows, total) in &ordered {
-        println!("\n{name:<40} {:>10}", human(*total));
-        for (comm, n, bytes) in rows {
-            println!("  {comm:<30} {n:>4} st {:>10}", human(*bytes));
+    print_header(grand, paint);
+
+    // Sessioner under 1 % av totalen kollapsar till en slutrad.
+    let mut n_show = sessions.len();
+    if !all {
+        n_show = sessions
+            .iter()
+            .enumerate()
+            .take_while(|(i, s)| *i == 0 || s.total * 100 >= grand)
+            .count();
+        if sessions.len() - n_show == 1 {
+            n_show = sessions.len(); // "… 1 session till" döljer inget; visa den
         }
     }
 
-    let grand: u64 = ordered.iter().map(|(_, _, t)| t).sum();
-    println!("\n{:<40} {:>10}", "summa processer", human(grand));
-    if any_rss_fallback {
-        println!("(vissa processer kunde inte läsas som PSS; RSS använd, kan överdriva delat minne)");
+    let visible: Vec<usize> = sessions[..n_show]
+        .iter()
+        .map(|s| visible_row_count(&s.rows, s.total, all))
+        .collect();
+
+    let name_w = sessions[..n_show]
+        .iter()
+        .map(|s| s.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(14);
+    let row_w = sessions[..n_show]
+        .iter()
+        .zip(&visible)
+        .flat_map(|(s, &k)| s.rows[..k].iter())
+        .map(|r| r.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(12);
+
+    for (s, &k) in sessions[..n_show].iter().zip(&visible) {
+        let pct = if grand > 0 { s.total * 100 / grand } else { 0 };
+        println!(
+            "\n{} {}  {} {}",
+            paint.w(Paint::BOLD, &format!("{:<name_w$}", s.name)),
+            paint.w(Paint::BOLD, &format!("{:>9}", human(s.total))),
+            bar(pct, paint),
+            paint.w(Paint::DIM, &format!("{pct:>3}%")),
+        );
+        for r in &s.rows[..k] {
+            println!(
+                "  {:<row_w$} {:>4} st {:>9}",
+                r.name,
+                r.count,
+                human(r.bytes)
+            );
+        }
+        if k < s.rows.len() {
+            let rest = &s.rows[k..];
+            let bytes: u64 = rest.iter().map(|r| r.bytes).sum();
+            println!(
+                "  {}",
+                paint.w(
+                    Paint::DIM,
+                    &format!("{:<row_w$} {:7} {:>9}", format!("… {} till", rest.len()), "", human(bytes)),
+                )
+            );
+        }
     }
+
+    if n_show < sessions.len() {
+        let rest = &sessions[n_show..];
+        let bytes: u64 = rest.iter().map(|s| s.total).sum();
+        println!(
+            "\n{}",
+            paint.w(
+                Paint::DIM,
+                &format!("{:<name_w$} {:>9}", format!("… {} sessioner till", rest.len()), human(bytes)),
+            )
+        );
+    }
+
+    if any_rss_fallback {
+        println!(
+            "{}",
+            paint.w(
+                Paint::DIM,
+                "(vissa processer kunde inte läsas som PSS; RSS använd, kan överdriva delat minne)",
+            )
+        );
+    }
+}
+
+/// Visa rader tills de täcker 90 % av sessionen, max MAX_ROWS_PER_SESSION.
+fn visible_row_count(rows: &[Row], total: u64, all: bool) -> usize {
+    if all {
+        return rows.len();
+    }
+    let mut cum = 0u64;
+    let mut k = 0;
+    for r in rows {
+        if k >= MAX_ROWS_PER_SESSION || cum * 10 >= total * 9 {
+            break;
+        }
+        cum += r.bytes;
+        k += 1;
+    }
+    if rows.len() - k == 1 {
+        k += 1; // "… 1 till" tar samma plats som raden själv
+    }
+    k
+}
+
+fn bar(pct: u64, paint: Paint) -> String {
+    let filled = ((pct as usize * BAR_WIDTH + 50) / 100)
+        .clamp(usize::from(pct > 0), BAR_WIDTH);
+    let color = match pct {
+        30.. => Paint::RED,
+        10.. => Paint::YELLOW,
+        _ => Paint::GREEN,
+    };
+    format!(
+        "{}{}",
+        paint.w(color, &"█".repeat(filled)),
+        paint.w(Paint::DIM, &"░".repeat(BAR_WIDTH - filled)),
+    )
 }
 
 fn read_procs() -> Vec<Proc> {
@@ -108,13 +259,52 @@ fn read_procs() -> Vec<Proc> {
         out.push(Proc {
             pid,
             ppid,
-            comm,
+            name: proc_name(&base, &comm),
             mem,
             pss,
             tmux_pane_env: tmux_pane_from_environ(&base),
         });
     }
     out
+}
+
+/// Processtypens namn: basename ur cmdline (comm huggs av vid 15 tecken).
+/// För interpreters (node, dotnet, …) används skriptets/dll:ens namn
+/// istället — så MSBuild-noder heter "MSBuild", inte "dotnet".
+fn proc_name(base: &str, comm: &str) -> String {
+    let Ok(raw) = fs::read(format!("{base}/cmdline")) else { return comm.to_string() };
+    // Processer som skriver om sin titel ("npm exec …") har mellanslag i
+    // ett enda argv-fält; platta ut till tokens oavsett.
+    let toks: Vec<&str> = raw
+        .split(|&b| b == 0)
+        .filter_map(|s| std::str::from_utf8(s).ok())
+        .flat_map(str::split_whitespace)
+        .collect();
+    let Some(first) = toks.first() else { return comm.to_string() };
+    let name = basename(first).trim_end_matches(':');
+    const INTERPRETERS: &[&str] = &["node", "dotnet", "python", "python3", "ruby", "java", "bun", "deno", "mono"];
+    if INTERPRETERS.contains(&name) {
+        for t in &toks[1..] {
+            if t.starts_with('-') {
+                continue;
+            }
+            let b = basename(t);
+            for ext in [".dll", ".js", ".mjs", ".cjs", ".py", ".jar", ".rb"] {
+                if let Some(stem) = b.strip_suffix(ext) {
+                    return stem.to_string();
+                }
+            }
+        }
+    }
+    if name.is_empty() {
+        comm.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 fn pss_kb(base: &str) -> Option<u64> {
@@ -180,7 +370,7 @@ fn session_of(
     OUTSIDE.to_string()
 }
 
-fn print_meminfo_header() {
+fn print_header(grand: u64, paint: Paint) {
     let Ok(mi) = fs::read_to_string("/proc/meminfo") else { return };
     let kb = |key: &str| -> u64 {
         mi.lines()
@@ -189,19 +379,15 @@ fn print_meminfo_header() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
     };
-    let total = kb("MemTotal:") * 1024;
-    let avail = kb("MemAvailable:") * 1024;
-    let cache = kb("Cached:") * 1024;
-    let shmem = kb("Shmem:") * 1024;
-    let swap_used = (kb("SwapTotal:") - kb("SwapFree:")) * 1024;
-    println!(
-        "RAM {} totalt, {} tillgängligt  |  cache {} (varav shmem {})  |  swap använt {}",
-        human(total),
-        human(avail),
-        human(cache),
-        human(shmem),
-        human(swap_used)
+    let line = format!(
+        "RAM {} · {} tillgängligt · cache {} · swap {} · processer {} (PSS)",
+        human(kb("MemTotal:") * 1024),
+        human(kb("MemAvailable:") * 1024),
+        human(kb("Cached:") * 1024),
+        human((kb("SwapTotal:") - kb("SwapFree:")) * 1024),
+        human(grand),
     );
+    println!("{}", paint.w(Paint::DIM, &line));
 }
 
 fn human(bytes: u64) -> String {
