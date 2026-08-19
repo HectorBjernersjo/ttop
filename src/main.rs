@@ -165,6 +165,15 @@ fn main() {
             bar(pct, paint),
             paint.w(Paint::DIM, &format!("{pct:>3}%")),
         );
+        // Rader fallande: sessionens största process direkt under rubriken.
+        for r in &s.rows[..k] {
+            println!(
+                "  {:<row_w$} {:>4} st {:>9}",
+                r.name,
+                r.count,
+                human(r.bytes)
+            );
+        }
         if k < s.rows.len() {
             let rest = &s.rows[k..];
             let bytes: u64 = rest.iter().map(|r| r.bytes).sum();
@@ -174,14 +183,6 @@ fn main() {
                     Paint::DIM,
                     &format!("{:<row_w$} {:7} {:>9}", format!("… {} till", rest.len()), "", human(bytes)),
                 )
-            );
-        }
-        for r in s.rows[..k].iter().rev() {
-            println!(
-                "  {:<row_w$} {:>4} st {:>9}",
-                r.name,
-                r.count,
-                human(r.bytes)
             );
         }
     }
