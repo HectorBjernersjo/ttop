@@ -20,7 +20,10 @@ use std::process::Command;
 
 const OUTSIDE: &str = "[utanför tmux]";
 const BAR_WIDTH: usize = 20;
-const MAX_ROWS_PER_SESSION: usize = 6;
+// Rader visas vid >= 1 % av sessionens minne; sessioner vid >= 2 % av
+// totalen — en session ska förtjäna sin plats mer än en enskild rad.
+const ROW_MIN_PERCENT: u64 = 1;
+const SESSION_MIN_PERCENT: u64 = 2;
 
 struct Proc {
     pid: u32,
@@ -107,15 +110,13 @@ fn main() {
     sessions.sort_by(|a, b| b.total.cmp(&a.total));
     let grand: u64 = sessions.iter().map(|s| s.total).sum();
 
-    print_header(grand, paint);
-
-    // Sessioner under 1 % av totalen kollapsar till en slutrad.
+    // Sessioner under gränsen kollapsar till en samlingsrad.
     let mut n_show = sessions.len();
     if !all {
         n_show = sessions
             .iter()
             .enumerate()
-            .take_while(|(i, s)| *i == 0 || s.total * 100 >= grand)
+            .take_while(|(i, s)| *i == 0 || s.total * 100 >= grand * SESSION_MIN_PERCENT)
             .count();
         if sessions.len() - n_show == 1 {
             n_show = sessions.len(); // "… 1 session till" döljer inget; visa den
@@ -142,7 +143,20 @@ fn main() {
         .unwrap_or(0)
         .max(12);
 
-    for (s, &k) in sessions[..n_show].iter().zip(&visible) {
+    // Stigande ordning: det största hamnar längst ner, närmast prompten.
+    if n_show < sessions.len() {
+        let rest = &sessions[n_show..];
+        let bytes: u64 = rest.iter().map(|s| s.total).sum();
+        println!(
+            "{}",
+            paint.w(
+                Paint::DIM,
+                &format!("{:<name_w$} {:>9}", format!("… {} sessioner till", rest.len()), human(bytes)),
+            )
+        );
+    }
+
+    for (s, &k) in sessions[..n_show].iter().zip(&visible).rev() {
         let pct = if grand > 0 { s.total * 100 / grand } else { 0 };
         println!(
             "\n{} {}  {} {}",
@@ -151,14 +165,6 @@ fn main() {
             bar(pct, paint),
             paint.w(Paint::DIM, &format!("{pct:>3}%")),
         );
-        for r in &s.rows[..k] {
-            println!(
-                "  {:<row_w$} {:>4} st {:>9}",
-                r.name,
-                r.count,
-                human(r.bytes)
-            );
-        }
         if k < s.rows.len() {
             let rest = &s.rows[k..];
             let bytes: u64 = rest.iter().map(|r| r.bytes).sum();
@@ -170,20 +176,17 @@ fn main() {
                 )
             );
         }
+        for r in s.rows[..k].iter().rev() {
+            println!(
+                "  {:<row_w$} {:>4} st {:>9}",
+                r.name,
+                r.count,
+                human(r.bytes)
+            );
+        }
     }
 
-    if n_show < sessions.len() {
-        let rest = &sessions[n_show..];
-        let bytes: u64 = rest.iter().map(|s| s.total).sum();
-        println!(
-            "\n{}",
-            paint.w(
-                Paint::DIM,
-                &format!("{:<name_w$} {:>9}", format!("… {} sessioner till", rest.len()), human(bytes)),
-            )
-        );
-    }
-
+    println!();
     if any_rss_fallback {
         println!(
             "{}",
@@ -193,22 +196,19 @@ fn main() {
             )
         );
     }
+    print_header(grand, paint);
 }
 
-/// Visa rader tills de täcker 90 % av sessionen, max MAX_ROWS_PER_SESSION.
+/// Visa rader som står för minst ROW_MIN_PERCENT av sessionens minne.
 fn visible_row_count(rows: &[Row], total: u64, all: bool) -> usize {
     if all {
         return rows.len();
     }
-    let mut cum = 0u64;
-    let mut k = 0;
-    for r in rows {
-        if k >= MAX_ROWS_PER_SESSION || cum * 10 >= total * 9 {
-            break;
-        }
-        cum += r.bytes;
-        k += 1;
-    }
+    let mut k = rows
+        .iter()
+        .take_while(|r| r.bytes * 100 >= total * ROW_MIN_PERCENT)
+        .count()
+        .max(1);
     if rows.len() - k == 1 {
         k += 1; // "… 1 till" tar samma plats som raden själv
     }
@@ -281,7 +281,8 @@ fn proc_name(base: &str, comm: &str) -> String {
         .flat_map(str::split_whitespace)
         .collect();
     let Some(first) = toks.first() else { return comm.to_string() };
-    let name = basename(first).trim_end_matches(':');
+    // Login-shells har argv0 "-zsh"; setproctitle-namn kan sluta med ":".
+    let name = basename(first).trim_start_matches('-').trim_end_matches(':');
     const INTERPRETERS: &[&str] = &["node", "dotnet", "python", "python3", "ruby", "java", "bun", "deno", "mono"];
     if INTERPRETERS.contains(&name) {
         for t in &toks[1..] {
