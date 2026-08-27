@@ -1,12 +1,18 @@
-//! tmem — vad äter mitt RAM, per tmux-session.
+//! ttop — vad äter min maskin, per tmux-session.
 //!
 //! Grupperar alla processer per tmux-session (sessioner sorterade på total
-//! minnesanvändning), och inom varje session per processtyp. Processer
-//! utanför tmux hamnar i en egen hink. Default beskärs outputen till det
-//! som faktiskt förklarar minnesanvändningen; `--all` visar allt.
+//! förbrukning), och inom varje session per processtyp. Processer utanför
+//! tmux hamnar i en egen hink. Default beskärs outputen till det som
+//! faktiskt förklarar förbrukningen; `--all` visar allt.
 //!
-//! Minnesmått: PSS från /proc/<pid>/smaps_rollup när det går att läsa
-//! (delade sidor räknas proportionellt, så summorna går ihop), annars RSS.
+//! Mått: minne (default) eller CPU (`--cpu`). Ett mått i taget, för hela
+//! vyn är sortering och beskärning på just det måttet.
+//!
+//! Minne: PSS från /proc/<pid>/smaps_rollup när det går att läsa (delade
+//! sidor räknas proportionellt, så summorna går ihop), annars RSS.
+//!
+//! CPU: utime+stime ur /proc/<pid>/stat, samplat två gånger med en sekund
+//! emellan. Visas i procent av en kärna, så 400 % är fyra fulla kärnor.
 //!
 //! Sessionstillhörighet: förälderkedjan upp till en tmux-pane-pid. Faller
 //! tillbaka på TMUX_PANE i processens environ — det fångar föräldralösa
@@ -17,13 +23,34 @@ use std::env;
 use std::fs;
 use std::io::IsTerminal;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const OUTSIDE: &str = "[utanför tmux]";
 const BAR_WIDTH: usize = 20;
-// Rader visas vid >= 1 % av sessionens minne; sessioner vid >= 2 % av
+// Rader visas vid >= 1 % av sessionens förbrukning; sessioner vid >= 2 % av
 // totalen — en session ska förtjäna sin plats mer än en enskild rad.
 const ROW_MIN_PERCENT: u64 = 1;
 const SESSION_MIN_PERCENT: u64 = 2;
+const CPU_SAMPLE: Duration = Duration::from_secs(1);
+// Linux-default; libc::sysconf(_SC_CLK_TCK) hade varit rätt men kostar ett beroende.
+const CLK_TCK: u64 = 100;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Metric {
+    Mem,
+    Cpu,
+}
+
+impl Metric {
+    /// Värdet är bytes för Mem, hundradels procent av en kärna för Cpu.
+    fn fmt(self, v: u64) -> String {
+        match self {
+            Metric::Mem => human(v),
+            Metric::Cpu => format!("{:.1}%", v as f64 / 100.0),
+        }
+    }
+}
 
 struct Proc {
     pid: u32,
@@ -31,13 +58,14 @@ struct Proc {
     name: String,
     mem: u64, // bytes
     pss: bool,
+    cpu_ticks: u64, // utime + stime
     tmux_pane_env: Option<String>, // "%194"
 }
 
 struct Row {
     name: String,
     count: u32,
-    bytes: u64,
+    value: u64,
 }
 
 struct Session {
@@ -68,21 +96,44 @@ impl Paint {
 }
 
 fn main() {
-    let all = env::args().skip(1).any(|a| a == "-a" || a == "--all");
+    let mut all = false;
+    let mut metric = Metric::Mem;
+    for a in env::args().skip(1) {
+        match a.as_str() {
+            "-a" | "--all" => all = true,
+            "-c" | "--cpu" => metric = Metric::Cpu,
+            "-m" | "--mem" => metric = Metric::Mem,
+            "-h" | "--help" => {
+                println!("ttop [--mem|--cpu] [--all]\n  --mem  minne per tmux-session (default)\n  --cpu  CPU per tmux-session, samplat under en sekund\n  --all  visa alla rader och sessioner");
+                return;
+            }
+            _ => {
+                eprintln!("okänd flagga: {a}");
+                std::process::exit(2);
+            }
+        }
+    }
     let paint = Paint {
         on: std::io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
     };
 
-    let procs = read_procs();
+    let mut procs = read_procs();
+    if metric == Metric::Cpu {
+        sample_cpu(&mut procs);
+    }
     let (pane_pid_to_session, pane_id_to_session) = tmux_panes();
     let ppid: HashMap<u32, u32> = procs.iter().map(|p| (p.pid, p.ppid)).collect();
 
-    // session -> processtyp -> (antal, bytes)
+    // session -> processtyp -> (antal, värde)
     let mut by_session: HashMap<String, HashMap<String, (u32, u64)>> = HashMap::new();
     let mut any_rss_fallback = false;
     for p in &procs {
-        if p.mem == 0 {
-            continue; // kärntrådar m.m.
+        let value = match metric {
+            Metric::Mem => p.mem,
+            Metric::Cpu => p.cpu_ticks,
+        };
+        if value == 0 {
+            continue; // kärntrådar, sovande processer m.m.
         }
         any_rss_fallback |= !p.pss;
         let session = session_of(p, &ppid, &pane_pid_to_session, &pane_id_to_session);
@@ -92,7 +143,7 @@ fn main() {
             .entry(p.name.clone())
             .or_insert((0, 0));
         e.0 += 1;
-        e.1 += p.mem;
+        e.1 += value;
     }
 
     let mut sessions: Vec<Session> = by_session
@@ -100,10 +151,10 @@ fn main() {
         .map(|(name, types)| {
             let mut rows: Vec<Row> = types
                 .into_iter()
-                .map(|(name, (count, bytes))| Row { name, count, bytes })
+                .map(|(name, (count, value))| Row { name, count, value })
                 .collect();
-            rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
-            let total = rows.iter().map(|r| r.bytes).sum();
+            rows.sort_by(|a, b| b.value.cmp(&a.value));
+            let total = rows.iter().map(|r| r.value).sum();
             Session { name, rows, total }
         })
         .collect();
@@ -146,12 +197,12 @@ fn main() {
     // Stigande ordning: det största hamnar längst ner, närmast prompten.
     if n_show < sessions.len() {
         let rest = &sessions[n_show..];
-        let bytes: u64 = rest.iter().map(|s| s.total).sum();
+        let sum: u64 = rest.iter().map(|s| s.total).sum();
         println!(
             "{}",
             paint.w(
                 Paint::DIM,
-                &format!("{:<name_w$} {:>9}", format!("… {} sessioner till", rest.len()), human(bytes)),
+                &format!("{:<name_w$} {:>9}", format!("… {} sessioner till", rest.len()), metric.fmt(sum)),
             )
         );
     }
@@ -161,7 +212,7 @@ fn main() {
         println!(
             "\n{} {}  {} {}",
             paint.w(Paint::BOLD, &format!("{:<name_w$}", s.name)),
-            paint.w(Paint::BOLD, &format!("{:>9}", human(s.total))),
+            paint.w(Paint::BOLD, &format!("{:>9}", metric.fmt(s.total))),
             bar(pct, paint),
             paint.w(Paint::DIM, &format!("{pct:>3}%")),
         );
@@ -171,24 +222,24 @@ fn main() {
                 "  {:<row_w$} {:>4} st {:>9}",
                 r.name,
                 r.count,
-                human(r.bytes)
+                metric.fmt(r.value)
             );
         }
         if k < s.rows.len() {
             let rest = &s.rows[k..];
-            let bytes: u64 = rest.iter().map(|r| r.bytes).sum();
+            let sum: u64 = rest.iter().map(|r| r.value).sum();
             println!(
                 "  {}",
                 paint.w(
                     Paint::DIM,
-                    &format!("{:<row_w$} {:7} {:>9}", format!("… {} till", rest.len()), "", human(bytes)),
+                    &format!("{:<row_w$} {:7} {:>9}", format!("… {} till", rest.len()), "", metric.fmt(sum)),
                 )
             );
         }
     }
 
     println!();
-    if any_rss_fallback {
+    if metric == Metric::Mem && any_rss_fallback {
         println!(
             "{}",
             paint.w(
@@ -197,17 +248,20 @@ fn main() {
             )
         );
     }
-    print_header(grand, paint);
+    match metric {
+        Metric::Mem => print_mem_header(grand, paint),
+        Metric::Cpu => print_cpu_header(grand, paint),
+    }
 }
 
-/// Visa rader som står för minst ROW_MIN_PERCENT av sessionens minne.
+/// Visa rader som står för minst ROW_MIN_PERCENT av sessionens förbrukning.
 fn visible_row_count(rows: &[Row], total: u64, all: bool) -> usize {
     if all {
         return rows.len();
     }
     let mut k = rows
         .iter()
-        .take_while(|r| r.bytes * 100 >= total * ROW_MIN_PERCENT)
+        .take_while(|r| r.value * 100 >= total * ROW_MIN_PERCENT)
         .count()
         .max(1);
     if rows.len() - k == 1 {
@@ -263,10 +317,34 @@ fn read_procs() -> Vec<Proc> {
             name: proc_name(&base, &comm),
             mem,
             pss,
+            cpu_ticks: cpu_ticks(pid).unwrap_or(0),
             tmux_pane_env: tmux_pane_from_environ(&base),
         });
     }
     out
+}
+
+/// Byt cpu_ticks från ackumulerat till förbrukning under CPU_SAMPLE, uttryckt
+/// i hundradels procent av en kärna. Processer som dött under tiden får 0.
+fn sample_cpu(procs: &mut [Proc]) {
+    let start = Instant::now();
+    thread::sleep(CPU_SAMPLE);
+    let elapsed = start.elapsed().as_secs_f64();
+    for p in procs {
+        let delta = cpu_ticks(p.pid).unwrap_or(p.cpu_ticks).saturating_sub(p.cpu_ticks);
+        p.cpu_ticks = (delta as f64 / CLK_TCK as f64 / elapsed * 10_000.0).round() as u64;
+    }
+}
+
+/// utime + stime ur /proc/<pid>/stat (fält 14 och 15, räknat efter comm).
+fn cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm kan innehålla mellanslag och parenteser; hoppa till sista ')'.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut f = rest.split_whitespace().skip(11); // fält 3..=13
+    let utime: u64 = f.next()?.parse().ok()?;
+    let stime: u64 = f.next()?.parse().ok()?;
+    Some(utime + stime)
 }
 
 /// Processtypens namn: basename ur cmdline (comm huggs av vid 15 tecken).
@@ -372,7 +450,7 @@ fn session_of(
     OUTSIDE.to_string()
 }
 
-fn print_header(grand: u64, paint: Paint) {
+fn print_mem_header(grand: u64, paint: Paint) {
     let Ok(mi) = fs::read_to_string("/proc/meminfo") else { return };
     let kb = |key: &str| -> u64 {
         mi.lines()
@@ -388,6 +466,19 @@ fn print_header(grand: u64, paint: Paint) {
         human(kb("Cached:") * 1024),
         human((kb("SwapTotal:") - kb("SwapFree:")) * 1024),
         human(grand),
+    );
+    println!("{}", paint.w(Paint::DIM, &line));
+}
+
+fn print_cpu_header(grand: u64, paint: Paint) {
+    let cores = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let load = fs::read_to_string("/proc/loadavg")
+        .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    let line = format!(
+        "{cores} kärnor · load {load} · processer {} av {}% (1 s)",
+        Metric::Cpu.fmt(grand),
+        cores * 100,
     );
     println!("{}", paint.w(Paint::DIM, &line));
 }
