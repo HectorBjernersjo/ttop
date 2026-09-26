@@ -113,9 +113,11 @@ impl Paint {
     const RED: &'static str = "31";
     const GREEN: &'static str = "32";
     const YELLOW: &'static str = "33";
+    const MAGENTA: &'static str = "35";
+    const CYAN: &'static str = "36";
 
     fn w(self, code: &str, s: &str) -> String {
-        if self.on {
+        if self.on && !s.is_empty() {
             format!("\x1b[{code}m{s}\x1b[0m")
         } else {
             s.to_string()
@@ -184,10 +186,10 @@ fn main() {
         };
         let zram: Vec<&SwapDev> = swaps.iter().filter(|d| d.zram_ram.is_some()).collect();
         if !zram.is_empty() {
-            kernel_row(ZRAM, zram.len() as u32, zram.iter().filter_map(|d| d.zram_ram).sum());
+            kernel_row(ZRAM, 0, zram.iter().filter_map(|d| d.zram_ram).sum());
         }
         if let Some(z) = zswap.as_ref().filter(|z| z.ram > 0) {
-            kernel_row(ZSWAP, 1, z.ram);
+            kernel_row(ZSWAP, 0, z.ram);
         }
     }
 
@@ -224,79 +226,55 @@ fn main() {
         .map(|s| visible_row_count(&s.rows, s.total.value, all))
         .collect();
 
+    let sys = match metric {
+        Metric::Mem => system_rows(&grand, &swaps, zswap.as_ref()),
+        Metric::Cpu => Vec::new(),
+    };
+    // Processnamn indenteras två steg under sessionen; alla tabeller delar kolumner.
     let name_w = sessions[..n_show]
         .iter()
-        .map(|s| s.name.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(14);
-    let row_w = sessions[..n_show]
-        .iter()
         .zip(&visible)
-        .flat_map(|(s, &k)| s.rows[..k].iter())
-        .map(|r| r.name.chars().count())
+        .flat_map(|(s, &k)| {
+            std::iter::once(s.name.chars().count())
+                .chain(s.rows[..k].iter().map(|r| r.name.chars().count() + 2))
+        })
+        .chain(sys.iter().map(|r| r.name.chars().count()))
         .max()
         .unwrap_or(0)
-        .max(12);
+        .max(22);
+    let t = Table { metric, name_w, grand: grand.value, paint };
+    let procs_in = |rows: &[Row]| rows.iter().map(|r| r.count).sum::<u32>();
 
     // Stigande ordning: det största hamnar längst ner, närmast prompten.
+    t.header();
     if n_show < sessions.len() {
         let rest = &sessions[n_show..];
-        let u = sum(rest.iter().map(|s| &s.total));
-        println!(
-            "{}",
-            paint.w(
-                Paint::DIM,
-                &format!(
-                    "{:<name_w$} {:>9}{}",
-                    format!("… {} sessioner till", rest.len()),
-                    metric.fmt(u.value),
-                    split(metric, &u),
-                ),
-            )
+        t.row(
+            &format!("… {} sessioner till", rest.len()),
+            rest.iter().map(|s| procs_in(&s.rows)).sum(),
+            &sum(rest.iter().map(|s| &s.total)),
+            Style::Dim,
         );
     }
-
     for (s, &k) in sessions[..n_show].iter().zip(&visible).rev() {
-        let pct = if grand.value > 0 { s.total.value * 100 / grand.value } else { 0 };
-        println!(
-            "\n{} {}  {} {}{}",
-            paint.w(Paint::BOLD, &format!("{:<name_w$}", s.name)),
-            paint.w(Paint::BOLD, &format!("{:>9}", metric.fmt(s.total.value))),
-            bar(pct, paint),
-            paint.w(Paint::DIM, &format!("{pct:>3}%")),
-            paint.w(Paint::DIM, &split(metric, &s.total)),
-        );
+        println!();
+        t.row(&s.name, procs_in(&s.rows), &s.total, Style::Head);
         // Rader fallande: sessionens största process direkt under rubriken.
         for r in &s.rows[..k] {
-            println!(
-                "  {:<row_w$} {:>4} st {:>9}{}",
-                r.name,
-                r.count,
-                metric.fmt(r.usage.value),
-                paint.w(Paint::DIM, &split(metric, &r.usage)),
-            );
+            t.row(&format!("  {}", r.name), r.count, &r.usage, Style::Normal);
         }
         if k < s.rows.len() {
             let rest = &s.rows[k..];
-            let u = sum(rest.iter().map(|r| &r.usage));
-            println!(
-                "  {}",
-                paint.w(
-                    Paint::DIM,
-                    &format!(
-                        "{:<row_w$} {:7} {:>9}{}",
-                        format!("… {} till", rest.len()),
-                        "",
-                        metric.fmt(u.value),
-                        split(metric, &u),
-                    ),
-                )
+            t.row(
+                &format!("  … {} typer till", rest.len()),
+                procs_in(rest),
+                &sum(rest.iter().map(|r| &r.usage)),
+                Style::Dim,
             );
         }
     }
-
-    println!();
+    t.rule();
+    t.row("totalt", sessions.iter().map(|s| procs_in(&s.rows)).sum(), &grand, Style::Head);
     if metric == Metric::Mem && any_rss_fallback {
         println!(
             "{}",
@@ -306,19 +284,156 @@ fn main() {
             )
         );
     }
+
+    println!();
     match metric {
-        Metric::Mem => print_mem_footer(&grand, &swaps, zswap.as_ref(), paint),
+        Metric::Mem => t.system(&sys),
         Metric::Cpu => print_cpu_header(grand.value, paint),
     }
 }
 
-/// "   RAM 840 MB  swap 1.6 GB" efter summan; tomt för CPU.
-fn split(metric: Metric, u: &Usage) -> String {
-    if metric != Metric::Mem {
-        return String::new();
+const VAL_W: usize = 9;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Style {
+    Head,
+    Normal,
+    Dim,
+}
+
+/// Kolumnerna: namn, antal processer, värden, stapel, andel av totalen.
+struct Table {
+    metric: Metric,
+    name_w: usize,
+    grand: u64,
+    paint: Paint,
+}
+
+impl Table {
+    fn text(&self, name: &str, count: &str, vals: &[String]) -> String {
+        let mut s = format!("{name:<w$} {count:>5}", w = self.name_w);
+        for v in vals {
+            s += &format!(" {v:>VAL_W$}");
+        }
+        s
     }
-    let swap = if u.swap == 0 { "–".to_string() } else { human(u.swap) };
-    format!("   RAM {:>9}  swap {:>9}", human(u.ram), swap)
+
+    fn header(&self) {
+        let (cols, legend) = match self.metric {
+            Metric::Mem => (
+                vec!["RAM", "swap", "summa"],
+                format!("{} RAM  {} swap", self.paint.w(Paint::CYAN, "█"), self.paint.w(Paint::MAGENTA, "▓")),
+            ),
+            Metric::Cpu => (vec!["CPU"], String::new()),
+        };
+        let cols: Vec<String> = cols.into_iter().map(String::from).collect();
+        let head = format!("{}  {legend}", self.paint.w(Paint::DIM, &self.text("", "antal", &cols)));
+        println!("{}", head.trim_end());
+    }
+
+    fn rule(&self) {
+        let n_vals = if self.metric == Metric::Mem { 3 } else { 1 };
+        let w = self.name_w + 6 + n_vals * (VAL_W + 1) + 2 + BAR_WIDTH + 5;
+        println!("{}", self.paint.w(Paint::DIM, &"─".repeat(w)));
+    }
+
+    /// count 0 lämnar antal tomt, t.ex. för zram som inte är en process.
+    fn row(&self, name: &str, count: u32, u: &Usage, style: Style) {
+        let count = if count == 0 { String::new() } else { count.to_string() };
+        let vals = match self.metric {
+            Metric::Mem => vec![
+                human(u.ram),
+                if u.swap == 0 { "–".to_string() } else { human(u.swap) },
+                human(u.value),
+            ],
+            Metric::Cpu => vec![self.metric.fmt(u.value)],
+        };
+        let text = self.text(name, &count, &vals);
+        let text = match style {
+            Style::Head => self.paint.w(Paint::BOLD, &text),
+            Style::Normal => text,
+            Style::Dim => self.paint.w(Paint::DIM, &text),
+        };
+        let pct = if self.grand > 0 { u.value * 100 / self.grand } else { 0 };
+        if pct == 0 && style != Style::Head {
+            println!("{}", format!("{text}  {}", self.share_bar(u, style, false)).trim_end());
+        } else {
+            let bar = self.share_bar(u, style, true);
+            println!("{text}  {bar} {}", self.paint.w(Paint::DIM, &format!("{pct:>3}%")));
+        }
+    }
+
+    /// Andel av totalen, uppdelad i RAM och swap. Samma skala på alla rader,
+    /// så staplarna går att jämföra mellan sessioner. Räknas i åttondelar av
+    /// ett tecken, så även en procent syns; RAM-delen avrundas till hela tecken.
+    /// `pad` fyller ut till full bredd, så att en procentkolumn efteråt hamnar rätt.
+    fn share_bar(&self, u: &Usage, style: Style, pad: bool) -> String {
+        const PARTIAL: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+        let eighths = |v: u64| {
+            if self.grand == 0 {
+                return 0;
+            }
+            let w = BAR_WIDTH as u128 * 8;
+            ((v as u128 * w + self.grand as u128 / 2) / self.grand as u128) as usize
+        };
+        let total = eighths(u.value).min(BAR_WIDTH * 8);
+        let ram = match self.metric {
+            Metric::Mem => (eighths(u.ram) + 4) / 8,
+            Metric::Cpu => total / 8,
+        }
+        .min(total / 8);
+        let rest = total - ram * 8; // swap, eller CPU:s sista bråkdel
+        let (ram_c, swap_c) = match (style, self.metric) {
+            (Style::Dim, _) => (Paint::DIM, Paint::DIM),
+            (_, Metric::Cpu) => (Paint::CYAN, Paint::CYAN),
+            _ => (Paint::CYAN, Paint::MAGENTA),
+        };
+        let full = if self.metric == Metric::Mem { "▓" } else { "█" };
+        let tail = format!("{}{}", full.repeat(rest / 8), PARTIAL[rest % 8]);
+        let used = ram + tail.chars().count();
+        // Bakgrund bara på sessionsrader; på processrader blir det brus.
+        let empty = if style == Style::Head { "░" } else { " " };
+        let empty = if pad { empty.repeat(BAR_WIDTH - used) } else { String::new() };
+        format!(
+            "{}{}{}",
+            self.paint.w(ram_c, &"█".repeat(ram)),
+            self.paint.w(swap_c, &tail),
+            self.paint.w(Paint::DIM, &empty),
+        )
+    }
+
+    /// RAM och swap-enheterna, i samma kolumner som tabellen ovanför.
+    fn system(&self, rows: &[SysRow]) {
+        let cols: Vec<String> = ["använt", "totalt", "kvar"].map(String::from).to_vec();
+        println!("{}", self.paint.w(Paint::DIM, &self.text("", "", &cols)));
+        for r in rows {
+            let pct = if r.size > 0 { r.used * 100 / r.size } else { 0 };
+            let free = r.size.saturating_sub(r.used);
+            let text = self.text(&r.name, "", &[human(r.used), human(r.size), human(free)]);
+            println!(
+                "{}  {} {}  {}",
+                self.paint.w(Paint::BOLD, &text),
+                fill_bar(pct, self.paint),
+                self.paint.w(Paint::DIM, &format!("{pct:>3}%")),
+                self.paint.w(Paint::DIM, &r.note),
+            );
+        }
+    }
+}
+
+/// Hur full en resurs är; färgen varnar när den närmar sig full.
+fn fill_bar(pct: u64, paint: Paint) -> String {
+    let filled = ((pct as usize * BAR_WIDTH + 50) / 100).clamp(usize::from(pct > 0), BAR_WIDTH);
+    let color = match pct {
+        90.. => Paint::RED,
+        70.. => Paint::YELLOW,
+        _ => Paint::GREEN,
+    };
+    format!(
+        "{}{}",
+        paint.w(color, &"█".repeat(filled)),
+        paint.w(Paint::DIM, &"░".repeat(BAR_WIDTH - filled)),
+    )
 }
 
 /// Visa rader som står för minst ROW_MIN_PERCENT av sessionens förbrukning.
@@ -335,21 +450,6 @@ fn visible_row_count(rows: &[Row], total: u64, all: bool) -> usize {
         k += 1; // "… 1 till" tar samma plats som raden själv
     }
     k
-}
-
-fn bar(pct: u64, paint: Paint) -> String {
-    let filled = ((pct as usize * BAR_WIDTH + 50) / 100)
-        .clamp(usize::from(pct > 0), BAR_WIDTH);
-    let color = match pct {
-        30.. => Paint::RED,
-        10.. => Paint::YELLOW,
-        _ => Paint::GREEN,
-    };
-    format!(
-        "{}{}",
-        paint.w(color, &"█".repeat(filled)),
-        paint.w(Paint::DIM, &"░".repeat(BAR_WIDTH - filled)),
-    )
 }
 
 fn read_procs() -> Vec<Proc> {
@@ -581,54 +681,45 @@ fn session_of(
     OUTSIDE.to_string()
 }
 
-/// En rad för RAM och en per swap-enhet, "använt / totalt".
-fn print_mem_footer(grand: &Usage, swaps: &[SwapDev], zswap: Option<&Zswap>, paint: Paint) {
-    let Ok(mi) = fs::read_to_string("/proc/meminfo") else { return };
+struct SysRow {
+    name: String,
+    used: u64,
+    size: u64,
+    note: String,
+}
+
+/// En rad för RAM, en för zswap om den är på, och en per swap-enhet.
+fn system_rows(grand: &Usage, swaps: &[SwapDev], zswap: Option<&Zswap>) -> Vec<SysRow> {
+    let Ok(mi) = fs::read_to_string("/proc/meminfo") else { return Vec::new() };
     let b = |key: &str| meminfo(&mi, key);
     let total = b("MemTotal:");
     let avail = b("MemAvailable:");
-    let label_w = swaps.iter().map(|d| d.name.chars().count() + 5).max().unwrap_or(0).max(5);
-    let used_of = |used: u64, size: u64| {
-        let pct = if size > 0 { used * 100 / size } else { 0 };
-        format!("{:>9} / {:<9} {pct:>3}%", human(used), human(size))
-    };
-    let mut lines = vec![format!(
-        "{:<label_w$}  {} · {} tillgängligt · cache {} · processer {}",
-        "RAM",
-        used_of(total - avail, total),
-        human(avail),
-        human(b("Cached:")),
-        human(
-            grand.ram
-                - swaps.iter().filter_map(|d| d.zram_ram).sum::<u64>()
-                - zswap.map_or(0, |z| z.ram)
-        ),
-    )];
+    let kernel_ram = swaps.iter().filter_map(|d| d.zram_ram).sum::<u64>() + zswap.map_or(0, |z| z.ram);
+    let compressed = |data: u64, ram: u64| format!("{:.1}× komprimerat", data as f64 / ram as f64);
+    let mut rows = vec![SysRow {
+        name: "RAM".to_string(),
+        used: total - avail,
+        size: total,
+        note: format!("cache {} · processer {}", human(b("Cached:")), human(grand.ram - kernel_ram)),
+    }];
     if let Some(z) = zswap {
-        let ratio = if z.ram > 0 { format!(" ({:.1}× komprimerat)", z.data as f64 / z.ram as f64) } else { String::new() };
-        lines.push(format!(
-            "{:<label_w$}  {} · {} data{ratio} · ingår i swap-enheternas använt",
-            "zswap",
-            used_of(z.ram, z.limit),
-            human(z.data),
-        ));
+        let ratio = if z.ram > 0 { format!(" ({})", compressed(z.data, z.ram)) } else { String::new() };
+        rows.push(SysRow {
+            name: "zswap".to_string(),
+            used: z.ram,
+            size: z.limit,
+            note: format!("{} data{ratio} · ingår i swap-enheternas använt", human(z.data)),
+        });
     }
     for d in swaps {
-        let what = match d.zram_ram {
-            Some(ram) if ram > 0 => format!("tar {} RAM ({:.1}× komprimerat)", human(ram), d.used as f64 / ram as f64),
+        let note = match d.zram_ram {
+            Some(ram) if ram > 0 => format!("zram, tar {} RAM ({})", human(ram), compressed(d.used, ram)),
             Some(_) => "zram".to_string(),
             None => "disk".to_string(),
         };
-        lines.push(format!(
-            "{:<label_w$}  {} · {} ledigt · {what}",
-            format!("swap {}", d.name),
-            used_of(d.used, d.size),
-            human(d.size.saturating_sub(d.used)),
-        ));
+        rows.push(SysRow { name: format!("swap {}", d.name), used: d.used, size: d.size, note });
     }
-    for l in lines {
-        println!("{}", paint.w(Paint::DIM, &l));
-    }
+    rows
 }
 
 fn print_cpu_header(grand: u64, paint: Paint) {
