@@ -8,8 +8,12 @@
 //! Mått: minne (default) eller CPU (`--cpu`). Ett mått i taget, för hela
 //! vyn är sortering och beskärning på just det måttet.
 //!
-//! Minne: PSS från /proc/<pid>/smaps_rollup när det går att läsa (delade
-//! sidor räknas proportionellt, så summorna går ihop), annars RSS.
+//! Minne: RAM + swap, eftersom båda frigörs när processen dör. RAM är PSS
+//! och swap SwapPss ur /proc/<pid>/smaps_rollup när det går att läsa (delade
+//! sidor räknas proportionellt, så summorna går ihop), annars VmRSS/VmSwap.
+//! zram och zswap visas som egna rader: det komprimerade innehållet ligger i
+//! RAM men tillhör ingen process. Samma sidor syns alltså två gånger,
+//! okomprimerat som processens swap och komprimerat som zram/zswaps RAM.
 //!
 //! CPU: utime+stime ur /proc/<pid>/stat, samplat två gånger med en sekund
 //! emellan. Visas i procent av en kärna, så 400 % är fyra fulla kärnor.
@@ -27,6 +31,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const OUTSIDE: &str = "[utanför tmux]";
+const ZRAM: &str = "[zram]";
+const ZSWAP: &str = "[zswap]";
 const BAR_WIDTH: usize = 20;
 // Rader visas vid >= 1 % av sessionens förbrukning; sessioner vid >= 2 % av
 // totalen — en session ska förtjäna sin plats mer än en enskild rad.
@@ -43,7 +49,7 @@ enum Metric {
 }
 
 impl Metric {
-    /// Värdet är bytes för Mem, hundradels procent av en kärna för Cpu.
+    /// Värdet är bytes (RAM + swap) för Mem, hundradels procent av en kärna för Cpu.
     fn fmt(self, v: u64) -> String {
         match self {
             Metric::Mem => human(v),
@@ -56,22 +62,44 @@ struct Proc {
     pid: u32,
     ppid: u32,
     name: String,
-    mem: u64, // bytes
+    ram: u64,  // bytes
+    swap: u64, // bytes
     pss: bool,
     cpu_ticks: u64, // utime + stime
     tmux_pane_env: Option<String>, // "%194"
 }
 
+#[derive(Default)]
+struct Usage {
+    value: u64, // det som sorteras och beskärs på
+    ram: u64,
+    swap: u64,
+}
+
+impl Usage {
+    fn add(&mut self, o: &Usage) {
+        self.value += o.value;
+        self.ram += o.ram;
+        self.swap += o.swap;
+    }
+}
+
 struct Row {
     name: String,
     count: u32,
-    value: u64,
+    usage: Usage,
 }
 
 struct Session {
     name: String,
     rows: Vec<Row>,
-    total: u64,
+    total: Usage,
+}
+
+fn sum<'a>(it: impl Iterator<Item = &'a Usage>) -> Usage {
+    let mut u = Usage::default();
+    it.for_each(|x| u.add(x));
+    u
 }
 
 #[derive(Clone, Copy)]
@@ -104,7 +132,7 @@ fn main() {
             "-c" | "--cpu" => metric = Metric::Cpu,
             "-m" | "--mem" => metric = Metric::Mem,
             "-h" | "--help" => {
-                println!("ttop [--mem|--cpu] [--all]\n  --mem  minne per tmux-session (default)\n  --cpu  CPU per tmux-session, samplat under en sekund\n  --all  visa alla rader och sessioner");
+                println!("ttop [--mem|--cpu] [--all]\n  --mem  minne (RAM + swap) per tmux-session (default)\n  --cpu  CPU per tmux-session, samplat under en sekund\n  --all  visa alla rader och sessioner");
                 return;
             }
             _ => {
@@ -124,15 +152,15 @@ fn main() {
     let (pane_pid_to_session, pane_id_to_session) = tmux_panes();
     let ppid: HashMap<u32, u32> = procs.iter().map(|p| (p.pid, p.ppid)).collect();
 
-    // session -> processtyp -> (antal, värde)
-    let mut by_session: HashMap<String, HashMap<String, (u32, u64)>> = HashMap::new();
+    // session -> processtyp -> (antal, förbrukning)
+    let mut by_session: HashMap<String, HashMap<String, (u32, Usage)>> = HashMap::new();
     let mut any_rss_fallback = false;
     for p in &procs {
-        let value = match metric {
-            Metric::Mem => p.mem,
-            Metric::Cpu => p.cpu_ticks,
+        let usage = match metric {
+            Metric::Mem => Usage { value: p.ram + p.swap, ram: p.ram, swap: p.swap },
+            Metric::Cpu => Usage { value: p.cpu_ticks, ..Default::default() },
         };
-        if value == 0 {
+        if usage.value == 0 {
             continue; // kärntrådar, sovande processer m.m.
         }
         any_rss_fallback |= !p.pss;
@@ -141,9 +169,26 @@ fn main() {
             .entry(session)
             .or_default()
             .entry(p.name.clone())
-            .or_insert((0, 0));
+            .or_default();
         e.0 += 1;
-        e.1 += value;
+        e.1.add(&usage);
+    }
+    let swaps = read_swaps();
+    let zswap = read_zswap();
+    if metric == Metric::Mem {
+        let mut kernel_row = |name: &str, count: u32, ram: u64| {
+            by_session
+                .entry(OUTSIDE.to_string())
+                .or_default()
+                .insert(name.to_string(), (count, Usage { value: ram, ram, swap: 0 }));
+        };
+        let zram: Vec<&SwapDev> = swaps.iter().filter(|d| d.zram_ram.is_some()).collect();
+        if !zram.is_empty() {
+            kernel_row(ZRAM, zram.len() as u32, zram.iter().filter_map(|d| d.zram_ram).sum());
+        }
+        if let Some(z) = zswap.as_ref().filter(|z| z.ram > 0) {
+            kernel_row(ZSWAP, 1, z.ram);
+        }
     }
 
     let mut sessions: Vec<Session> = by_session
@@ -151,15 +196,15 @@ fn main() {
         .map(|(name, types)| {
             let mut rows: Vec<Row> = types
                 .into_iter()
-                .map(|(name, (count, value))| Row { name, count, value })
+                .map(|(name, (count, usage))| Row { name, count, usage })
                 .collect();
-            rows.sort_by(|a, b| b.value.cmp(&a.value));
-            let total = rows.iter().map(|r| r.value).sum();
+            rows.sort_by(|a, b| b.usage.value.cmp(&a.usage.value));
+            let total = sum(rows.iter().map(|r| &r.usage));
             Session { name, rows, total }
         })
         .collect();
-    sessions.sort_by(|a, b| b.total.cmp(&a.total));
-    let grand: u64 = sessions.iter().map(|s| s.total).sum();
+    sessions.sort_by(|a, b| b.total.value.cmp(&a.total.value));
+    let grand = sum(sessions.iter().map(|s| &s.total));
 
     // Sessioner under gränsen kollapsar till en samlingsrad.
     let mut n_show = sessions.len();
@@ -167,7 +212,7 @@ fn main() {
         n_show = sessions
             .iter()
             .enumerate()
-            .take_while(|(i, s)| *i == 0 || s.total * 100 >= grand * SESSION_MIN_PERCENT)
+            .take_while(|(i, s)| *i == 0 || s.total.value * 100 >= grand.value * SESSION_MIN_PERCENT)
             .count();
         if sessions.len() - n_show == 1 {
             n_show = sessions.len(); // "… 1 session till" döljer inget; visa den
@@ -176,7 +221,7 @@ fn main() {
 
     let visible: Vec<usize> = sessions[..n_show]
         .iter()
-        .map(|s| visible_row_count(&s.rows, s.total, all))
+        .map(|s| visible_row_count(&s.rows, s.total.value, all))
         .collect();
 
     let name_w = sessions[..n_show]
@@ -197,42 +242,55 @@ fn main() {
     // Stigande ordning: det största hamnar längst ner, närmast prompten.
     if n_show < sessions.len() {
         let rest = &sessions[n_show..];
-        let sum: u64 = rest.iter().map(|s| s.total).sum();
+        let u = sum(rest.iter().map(|s| &s.total));
         println!(
             "{}",
             paint.w(
                 Paint::DIM,
-                &format!("{:<name_w$} {:>9}", format!("… {} sessioner till", rest.len()), metric.fmt(sum)),
+                &format!(
+                    "{:<name_w$} {:>9}{}",
+                    format!("… {} sessioner till", rest.len()),
+                    metric.fmt(u.value),
+                    split(metric, &u),
+                ),
             )
         );
     }
 
     for (s, &k) in sessions[..n_show].iter().zip(&visible).rev() {
-        let pct = if grand > 0 { s.total * 100 / grand } else { 0 };
+        let pct = if grand.value > 0 { s.total.value * 100 / grand.value } else { 0 };
         println!(
-            "\n{} {}  {} {}",
+            "\n{} {}  {} {}{}",
             paint.w(Paint::BOLD, &format!("{:<name_w$}", s.name)),
-            paint.w(Paint::BOLD, &format!("{:>9}", metric.fmt(s.total))),
+            paint.w(Paint::BOLD, &format!("{:>9}", metric.fmt(s.total.value))),
             bar(pct, paint),
             paint.w(Paint::DIM, &format!("{pct:>3}%")),
+            paint.w(Paint::DIM, &split(metric, &s.total)),
         );
         // Rader fallande: sessionens största process direkt under rubriken.
         for r in &s.rows[..k] {
             println!(
-                "  {:<row_w$} {:>4} st {:>9}",
+                "  {:<row_w$} {:>4} st {:>9}{}",
                 r.name,
                 r.count,
-                metric.fmt(r.value)
+                metric.fmt(r.usage.value),
+                paint.w(Paint::DIM, &split(metric, &r.usage)),
             );
         }
         if k < s.rows.len() {
             let rest = &s.rows[k..];
-            let sum: u64 = rest.iter().map(|r| r.value).sum();
+            let u = sum(rest.iter().map(|r| &r.usage));
             println!(
                 "  {}",
                 paint.w(
                     Paint::DIM,
-                    &format!("{:<row_w$} {:7} {:>9}", format!("… {} till", rest.len()), "", metric.fmt(sum)),
+                    &format!(
+                        "{:<row_w$} {:7} {:>9}{}",
+                        format!("… {} till", rest.len()),
+                        "",
+                        metric.fmt(u.value),
+                        split(metric, &u),
+                    ),
                 )
             );
         }
@@ -244,14 +302,23 @@ fn main() {
             "{}",
             paint.w(
                 Paint::DIM,
-                "(vissa processer kunde inte läsas som PSS; RSS använd, kan överdriva delat minne)",
+                "(vissa processer kunde inte läsas som PSS; RSS/VmSwap använt, kan överdriva delat minne)",
             )
         );
     }
     match metric {
-        Metric::Mem => print_mem_header(grand, paint),
-        Metric::Cpu => print_cpu_header(grand, paint),
+        Metric::Mem => print_mem_footer(&grand, &swaps, zswap.as_ref(), paint),
+        Metric::Cpu => print_cpu_header(grand.value, paint),
     }
+}
+
+/// "   RAM 840 MB  swap 1.6 GB" efter summan; tomt för CPU.
+fn split(metric: Metric, u: &Usage) -> String {
+    if metric != Metric::Mem {
+        return String::new();
+    }
+    let swap = if u.swap == 0 { "–".to_string() } else { human(u.swap) };
+    format!("   RAM {:>9}  swap {:>9}", human(u.ram), swap)
 }
 
 /// Visa rader som står för minst ROW_MIN_PERCENT av sessionens förbrukning.
@@ -261,7 +328,7 @@ fn visible_row_count(rows: &[Row], total: u64, all: bool) -> usize {
     }
     let mut k = rows
         .iter()
-        .take_while(|r| r.value * 100 >= total * ROW_MIN_PERCENT)
+        .take_while(|r| r.usage.value * 100 >= total * ROW_MIN_PERCENT)
         .count()
         .max(1);
     if rows.len() - k == 1 {
@@ -297,25 +364,26 @@ fn read_procs() -> Vec<Proc> {
         let mut comm = String::new();
         let mut ppid = 0u32;
         let mut rss_kb = 0u64;
+        let mut swap_kb = 0u64;
         for line in status.lines() {
             match line.split_once(':') {
                 Some(("Name", v)) => comm = v.trim().to_string(),
                 Some(("PPid", v)) => ppid = v.trim().parse().unwrap_or(0),
-                Some(("VmRSS", v)) => {
-                    rss_kb = v.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0)
-                }
+                Some(("VmRSS", v)) => rss_kb = kb_value(v),
+                Some(("VmSwap", v)) => swap_kb = kb_value(v),
                 _ => {}
             }
         }
-        let (mem, pss) = match pss_kb(&base) {
-            Some(kb) => (kb * 1024, true),
-            None => (rss_kb * 1024, false),
+        let ((ram_kb, swap_kb), pss) = match pss_kb(&base) {
+            Some(v) => (v, true),
+            None => ((rss_kb, swap_kb), false),
         };
         out.push(Proc {
             pid,
             ppid,
             name: proc_name(&base, &comm),
-            mem,
+            ram: ram_kb * 1024,
+            swap: swap_kb * 1024,
             pss,
             cpu_ticks: cpu_ticks(pid).unwrap_or(0),
             tmux_pane_env: tmux_pane_from_environ(&base),
@@ -387,13 +455,76 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn pss_kb(base: &str) -> Option<u64> {
+/// "  1234 kB" -> 1234
+fn kb_value(v: &str) -> u64 {
+    v.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
+/// (Pss, SwapPss) i kB ur smaps_rollup.
+fn pss_kb(base: &str) -> Option<(u64, u64)> {
     let rollup = fs::read_to_string(format!("{base}/smaps_rollup")).ok()?;
-    rollup
+    let field = |key: &str| rollup.lines().find_map(|l| l.strip_prefix(key)).map(kb_value);
+    Some((field("Pss:")?, field("SwapPss:").unwrap_or(0)))
+}
+
+/// zswap: komprimerad cache i RAM framför swap-enheterna. Sidorna har
+/// fortfarande en plats reserverad på enheten och räknas i dess "använt".
+struct Zswap {
+    ram: u64,   // komprimerat, det RAM poolen tar
+    data: u64,  // okomprimerat
+    limit: u64, // max_pool_percent av RAM
+}
+
+/// None när zswap är avslaget och tomt.
+fn read_zswap() -> Option<Zswap> {
+    let mi = fs::read_to_string("/proc/meminfo").ok()?;
+    let param = |name: &str| fs::read_to_string(format!("/sys/module/zswap/parameters/{name}")).ok();
+    let enabled = param("enabled").is_some_and(|v| v.trim() == "Y");
+    let (ram, data) = (meminfo(&mi, "Zswap:"), meminfo(&mi, "Zswapped:"));
+    if !enabled && data == 0 {
+        return None;
+    }
+    let pct: u64 = param("max_pool_percent").and_then(|v| v.trim().parse().ok()).unwrap_or(20);
+    Some(Zswap { ram, data, limit: meminfo(&mi, "MemTotal:") * pct / 100 })
+}
+
+/// Ett fält ur /proc/meminfo i bytes.
+fn meminfo(mi: &str, key: &str) -> u64 {
+    mi.lines().find_map(|l| l.strip_prefix(key)).map(kb_value).unwrap_or(0) * 1024
+}
+
+struct SwapDev {
+    name: String, // "zram0", "swapfile"
+    size: u64,    // bytes
+    used: u64,
+    zram_ram: Option<u64>, // RAM som zram-enheten faktiskt tar
+}
+
+/// Swap-enheter ur /proc/swaps, i den ordning kernel fyller dem.
+fn read_swaps() -> Vec<SwapDev> {
+    let Ok(s) = fs::read_to_string("/proc/swaps") else { return Vec::new() };
+    let mut devs: Vec<(i64, SwapDev)> = s
         .lines()
-        .find(|l| l.starts_with("Pss:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|v| v.parse().ok())
+        .skip(1)
+        .filter_map(|l| {
+            // Filename Type Size Used Priority; filnamnet kan innehålla mellanslag.
+            let mut f = l.split_whitespace().rev();
+            let prio: i64 = f.next()?.parse().ok()?;
+            let used: u64 = f.next()?.parse().ok()?;
+            let size: u64 = f.next()?.parse().ok()?;
+            let path = l.split_whitespace().next()?;
+            let name = basename(path).to_string();
+            // mm_stat fält 3: mem_used_total, komprimerad data plus overhead.
+            let zram_ram = name
+                .starts_with("zram")
+                .then(|| fs::read_to_string(format!("/sys/block/{name}/mm_stat")).ok())
+                .flatten()
+                .and_then(|m| m.split_whitespace().nth(2)?.parse().ok());
+            Some((prio, SwapDev { name, size: size * 1024, used: used * 1024, zram_ram }))
+        })
+        .collect();
+    devs.sort_by(|a, b| b.0.cmp(&a.0));
+    devs.into_iter().map(|(_, d)| d).collect()
 }
 
 fn tmux_pane_from_environ(base: &str) -> Option<String> {
@@ -450,24 +581,54 @@ fn session_of(
     OUTSIDE.to_string()
 }
 
-fn print_mem_header(grand: u64, paint: Paint) {
+/// En rad för RAM och en per swap-enhet, "använt / totalt".
+fn print_mem_footer(grand: &Usage, swaps: &[SwapDev], zswap: Option<&Zswap>, paint: Paint) {
     let Ok(mi) = fs::read_to_string("/proc/meminfo") else { return };
-    let kb = |key: &str| -> u64 {
-        mi.lines()
-            .find(|l| l.starts_with(key))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
+    let b = |key: &str| meminfo(&mi, key);
+    let total = b("MemTotal:");
+    let avail = b("MemAvailable:");
+    let label_w = swaps.iter().map(|d| d.name.chars().count() + 5).max().unwrap_or(0).max(5);
+    let used_of = |used: u64, size: u64| {
+        let pct = if size > 0 { used * 100 / size } else { 0 };
+        format!("{:>9} / {:<9} {pct:>3}%", human(used), human(size))
     };
-    let line = format!(
-        "RAM {} · {} tillgängligt · cache {} · swap {} · processer {} (PSS)",
-        human(kb("MemTotal:") * 1024),
-        human(kb("MemAvailable:") * 1024),
-        human(kb("Cached:") * 1024),
-        human((kb("SwapTotal:") - kb("SwapFree:")) * 1024),
-        human(grand),
-    );
-    println!("{}", paint.w(Paint::DIM, &line));
+    let mut lines = vec![format!(
+        "{:<label_w$}  {} · {} tillgängligt · cache {} · processer {}",
+        "RAM",
+        used_of(total - avail, total),
+        human(avail),
+        human(b("Cached:")),
+        human(
+            grand.ram
+                - swaps.iter().filter_map(|d| d.zram_ram).sum::<u64>()
+                - zswap.map_or(0, |z| z.ram)
+        ),
+    )];
+    if let Some(z) = zswap {
+        let ratio = if z.ram > 0 { format!(" ({:.1}× komprimerat)", z.data as f64 / z.ram as f64) } else { String::new() };
+        lines.push(format!(
+            "{:<label_w$}  {} · {} data{ratio} · ingår i swap-enheternas använt",
+            "zswap",
+            used_of(z.ram, z.limit),
+            human(z.data),
+        ));
+    }
+    for d in swaps {
+        let what = match d.zram_ram {
+            Some(ram) if ram > 0 => format!("tar {} RAM ({:.1}× komprimerat)", human(ram), d.used as f64 / ram as f64),
+            Some(_) => "zram".to_string(),
+            None => "disk".to_string(),
+        };
+        lines.push(format!(
+            "{:<label_w$}  {} · {} ledigt · {what}",
+            format!("swap {}", d.name),
+            used_of(d.used, d.size),
+            human(d.size.saturating_sub(d.used)),
+        ));
+    }
+    for l in lines {
+        println!("{}", paint.w(Paint::DIM, &l));
+    }
 }
 
 fn print_cpu_header(grand: u64, paint: Paint) {
