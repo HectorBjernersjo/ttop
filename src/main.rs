@@ -3,7 +3,8 @@
 //! Grupperar alla processer per tmux-session (sessioner sorterade på total
 //! förbrukning), och inom varje session per processtyp. Containrar,
 //! maskiner och Kubernetes utanför tmux samlas i en egen hink, en rad per
-//! container eller kluster (se containers.rs). Övriga processer hamnar i
+//! container eller kluster (se containers.rs), och VM:ar i en till, en rad
+//! per VM med namnet ur qemus `-name`. Övriga processer hamnar i
 //! en hink för allt utanför tmux. Default beskärs outputen till det som
 //! faktiskt förklarar förbrukningen; `--all` visar allt.
 //!
@@ -53,6 +54,7 @@ macro_rules! out {
 
 const OUTSIDE: &str = "[utanför tmux]";
 const CONTAINERS: &str = "[containrar]";
+const VMS: &str = "[VM:ar]";
 const ZRAM: &str = "[zram]";
 const ZSWAP: &str = "[zswap]";
 const BAR_WIDTH: usize = 20;
@@ -97,6 +99,7 @@ struct Proc {
     cpu: u64, // hundradels procent av en kärna, under mätfönstret
     tmux_pane_env: Option<String>, // "%194"
     cgroup: Option<String>,
+    vm: Option<String>, // qemus -name
 }
 
 #[derive(Default)]
@@ -184,7 +187,7 @@ fn main() {
             "-c" | "--cpu" => sort = Metric::Cpu,
             "-m" | "--mem" => sort = Metric::Mem,
             "-h" | "--help" => {
-                out!("ttop [--mem|--cpu] [--all]\n  minne (RAM + swap) och CPU per tmux-session; CPU mäts under minst en sekund\n  containrar, VM:ar och Kubernetes utanför tmux visas en rad per container eller kluster\n  --mem  sortera på minne (default)\n  --cpu  sortera på CPU\n  --all  visa alla rader och sessioner");
+                out!("ttop [--mem|--cpu] [--all]\n  minne (RAM + swap) och CPU per tmux-session; CPU mäts under minst en sekund\n  containrar, VM:ar och Kubernetes utanför tmux visas en rad per container, VM eller kluster\n  --mem  sortera på minne (default)\n  --cpu  sortera på CPU\n  --all  visa alla rader och sessioner");
                 return;
             }
             _ => {
@@ -209,7 +212,11 @@ fn main() {
     let mut any_rss_fallback = false;
     for p in &procs {
         let usage = Usage { ram: p.ram, swap: p.swap, cpu: p.cpu };
-        let member = p.cgroup.as_deref().and_then(containers::classify);
+        // En egen cgroup (libvirt) går före qemus namn: den räknas exakt.
+        let member = p.cgroup.as_deref().and_then(containers::classify).or_else(|| {
+            let name = p.vm.clone()?;
+            Some(containers::vm(p.cgroup.as_deref(), name))
+        });
         if usage.mem() == 0 && usage.cpu == 0 {
             // Kärntrådar, sovande processer m.m. En sovande pod ska ändå
             // räknas i sitt klusters antal pods.
@@ -234,18 +241,20 @@ fn main() {
             (None, None) => OUTSIDE.to_string(),
         };
         any_rss_fallback |= !p.pss;
-        let e = by_session
-            .entry(session)
-            .or_default()
-            .entry(p.name.clone())
-            .or_default();
+        // Flera VM:ar i samma session ska gå att skilja åt.
+        let row = match &p.vm {
+            Some(vm) => format!("qemu {vm}"),
+            None => p.name.clone(),
+        };
+        let e = by_session.entry(session).or_default().entry(row).or_default();
         e.0 += 1;
         e.1.add(&usage);
     }
     let (groups, groups_rss) = containers.groups(&cpu.cgroups);
     any_rss_fallback |= groups_rss;
     for g in groups {
-        by_session.entry(CONTAINERS.to_string()).or_default().insert(g.name, (g.procs, g.usage));
+        let bucket = if g.vm { VMS } else { CONTAINERS };
+        by_session.entry(bucket.to_string()).or_default().insert(g.name, (g.procs, g.usage));
     }
     let swaps = read_swaps();
     let zswap = read_zswap();
@@ -333,8 +342,8 @@ fn main() {
         }
         if k < s.rows.len() {
             let rest = &s.rows[k..];
-            // Processrader är processtyper; containerrader är redan en per enhet.
-            let what = if s.name == CONTAINERS { "till" } else { "typer till" };
+            // Processrader är processtyper; container- och VM-rader är redan en per enhet.
+            let what = if s.name == CONTAINERS || s.name == VMS { "till" } else { "typer till" };
             t.row(
                 &format!("  … {} {what}", rest.len()),
                 procs_in(rest),
@@ -547,16 +556,18 @@ fn read_procs() -> Vec<Proc> {
             Some(v) => (v, true),
             None => ((rss_kb, swap_kb), false),
         };
+        let argv = argv(&base);
         out.push(Proc {
             pid,
             ppid,
-            name: proc_name(&base, &comm),
+            name: proc_name(&argv, &comm),
             ram: ram_kb * 1024,
             swap: swap_kb * 1024,
             pss,
             cpu: 0,
             tmux_pane_env: tmux_pane_from_environ(&base),
             cgroup: containers::cgroup_path(pid),
+            vm: containers::qemu_name(&argv),
         });
     }
     out
@@ -671,15 +682,19 @@ fn cpu_ticks(pid: u32) -> Option<u64> {
 /// Processtypens namn: basename ur cmdline (comm huggs av vid 15 tecken).
 /// För interpreters (node, dotnet, …) används skriptets/dll:ens namn
 /// istället — så MSBuild-noder heter "MSBuild", inte "dotnet".
-fn proc_name(base: &str, comm: &str) -> String {
-    let Ok(raw) = fs::read(format!("{base}/cmdline")) else { return comm.to_string() };
+/// /proc/<pid>/cmdline som argv; tom för kärntrådar eller om den inte går att läsa.
+fn argv(base: &str) -> Vec<String> {
+    let Ok(raw) = fs::read(format!("{base}/cmdline")) else { return Vec::new() };
+    raw.split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| std::str::from_utf8(s).ok().map(str::to_string))
+        .collect()
+}
+
+fn proc_name(argv: &[String], comm: &str) -> String {
     // Processer som skriver om sin titel ("npm exec …") har mellanslag i
     // ett enda argv-fält; platta ut till tokens oavsett.
-    let toks: Vec<&str> = raw
-        .split(|&b| b == 0)
-        .filter_map(|s| std::str::from_utf8(s).ok())
-        .flat_map(str::split_whitespace)
-        .collect();
+    let toks: Vec<&str> = argv.iter().flat_map(|a| a.split_whitespace()).collect();
     let Some(first) = toks.first() else { return comm.to_string() };
     // Login-shells har argv0 "-zsh"; setproctitle-namn kan sluta med ":".
     let name = basename(first).trim_start_matches('-').trim_end_matches(':');

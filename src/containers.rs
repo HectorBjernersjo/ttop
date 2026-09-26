@@ -1,4 +1,6 @@
 //! Containrar, maskiner och Kubernetes, utpekade via processens cgroup.
+//! VM:ar som inte har en egen cgroup (Incus kör qemu i incus.service)
+//! känns istället igen på qemus kommandorad, se `vm`.
 //!
 //! /proc/<pid>/cgroup är läsbar för alla, och varje runtime namnger sina
 //! cgroups efter ett känt mönster (tabellen i `classify`). Den yttersta
@@ -56,6 +58,8 @@ pub enum Unit {
     Named { kind: &'static str, name: String },
     /// Kubernetes direkt på värden: alla pods plus kontrollplanets tjänst.
     Kube,
+    /// qemu utan egen cgroup, med namnet ur `-name`.
+    Vm { launcher: &'static str, name: String },
 }
 
 pub struct Membership {
@@ -65,6 +69,46 @@ pub struct Membership {
     pod: Option<String>,
     /// Kubernetes-distribution, när processen hör till kontrollplanets tjänst.
     distro: Option<&'static str>,
+    /// `dir` hör bara till enheten. Annars räknas processerna, inte cgroupen.
+    own_cgroup: bool,
+}
+
+/// En qemu-process som egen enhet. Vem som startat den syns på cgroupen,
+/// men den cgroupen delas med startarens egna processer.
+pub fn vm(cgroup: Option<&str>, name: String) -> Membership {
+    let comps: Vec<&str> = cgroup.unwrap_or("").split('/').collect();
+    let launcher = if comps.contains(&"incus.service") {
+        "incus"
+    } else if comps.iter().any(|c| *c == "lxd.service" || c.starts_with("snap.lxd.")) {
+        "lxd"
+    } else {
+        "qemu"
+    };
+    Membership { unit: Unit::Vm { launcher, name }, dir: String::new(), pod: None, distro: None, own_cgroup: false }
+}
+
+/// VM-namnet ur qemus argv: `-name vm1`, `-name vm1,process=…` eller
+/// libvirts `-name guest=vm1,debug-threads=on`. None om det inte är qemu
+/// eller saknar namn.
+pub fn qemu_name(argv: &[String]) -> Option<String> {
+    let exe = argv.first()?.rsplit('/').next()?;
+    if !(exe.starts_with("qemu-system-") || exe == "qemu-kvm" || exe == "kvm") {
+        return None;
+    }
+    let i = argv.iter().position(|a| a == "-name" || a == "--name")?;
+    let opts = argv.get(i + 1)?;
+    let first = opts.split(',').next().filter(|p| !p.contains('='));
+    opts.split(',')
+        .find_map(|p| p.strip_prefix("guest="))
+        .or(first)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
+/// libvirts maskinnamn "qemu-<nr>-<gäst>" -> gäst.
+fn libvirt_guest(machine: &str) -> Option<&str> {
+    let (nr, guest) = machine.strip_prefix("qemu-")?.split_once('-')?;
+    (!nr.is_empty() && nr.bytes().all(|b| b.is_ascii_digit())).then_some(guest)
 }
 
 /// Den cgroup-sökväg som räknas: v2-raden ("0::/…"), annars v1:s
@@ -126,6 +170,7 @@ pub fn classify(path: &str) -> Option<Membership> {
                 dir: comps[..=end].join("/"),
                 pod: comps[end + 1..].iter().find_map(|c| pod_uid(c)),
                 distro,
+                own_cgroup: true,
             });
         }
     }
@@ -215,6 +260,8 @@ struct UnitAcc {
     /// tmux själv kör i en container (distrobox, toolbox). Då skulle
     /// cgroupens siffror räkna de processerna två gånger.
     shared_with_tmux: bool,
+    /// Enheten har ingen egen cgroup att läsa (se `vm`).
+    no_cgroup: bool,
     distro: Option<&'static str>,
 }
 
@@ -225,6 +272,8 @@ pub struct Collector {
 
 pub struct Group {
     pub name: String,
+    /// Virtuell maskin, inte container eller kluster.
+    pub vm: bool,
     pub procs: u32,
     pub usage: Usage,
 }
@@ -232,7 +281,11 @@ pub struct Group {
 impl Collector {
     pub fn add(&mut self, m: Membership, usage: &Usage, pss: bool) {
         let acc = self.units.entry(m.unit).or_default();
-        acc.dirs.insert(m.dir);
+        if m.own_cgroup {
+            acc.dirs.insert(m.dir);
+        } else {
+            acc.no_cgroup = true;
+        }
         acc.pods.extend(m.pod);
         acc.procs += 1;
         acc.fallback.add(usage);
@@ -272,11 +325,12 @@ impl Collector {
             usage: Usage,
             pods: HashSet<String>,
             containers: u32,
+            vm: bool,
         }
         let mut merged: HashMap<String, Merged> = HashMap::new();
         let mut any_rss = false;
         for (unit, acc) in self.units {
-            let exact = cgroup_v2 && !acc.shared_with_tmux;
+            let exact = cgroup_v2 && !acc.shared_with_tmux && !acc.no_cgroup;
             let mut usage = match exact.then(|| cgroup_mem(&acc.dirs)).flatten() {
                 Some((ram, swap)) => Usage { ram, swap, ..Default::default() },
                 None => {
@@ -289,10 +343,16 @@ impl Collector {
                 .then(|| acc.dirs.iter().map(|d| cgroup_cpu.get(d)).sum::<Option<u64>>())
                 .flatten()
                 .unwrap_or(acc.fallback.cpu);
-            let name = match &unit {
-                Unit::Kube => acc.distro.unwrap_or("kubernetes").to_string(),
-                Unit::Named { kind, name } => format!("{kind} {name}"),
-                Unit::Container { runtime, id } => match info.get(id) {
+            let guest = match &unit {
+                Unit::Named { kind: "machine", name } => libvirt_guest(name),
+                _ => None,
+            };
+            let name = match (&unit, guest) {
+                (_, Some(g)) => format!("libvirt {g}"),
+                (Unit::Vm { launcher, name }, _) => format!("{launcher} {name}"),
+                (Unit::Kube, _) => acc.distro.unwrap_or("kubernetes").to_string(),
+                (Unit::Named { kind, name }, _) => format!("{kind} {name}"),
+                (Unit::Container { runtime, id }, _) => match info.get(id) {
                     Some(i) => i.group.clone().unwrap_or_else(|| i.name.clone()),
                     None => format!("{} {}", runtime.label(), &id[..12]),
                 },
@@ -302,6 +362,7 @@ impl Collector {
                 usage: Usage::default(),
                 pods: HashSet::new(),
                 containers: 0,
+                vm: guest.is_some() || matches!(unit, Unit::Vm { .. }),
             });
             m.procs += acc.procs;
             m.usage.add(&usage);
@@ -320,7 +381,7 @@ impl Collector {
                 } else {
                     name
                 };
-                Group { name, procs: m.procs, usage: m.usage }
+                Group { name, vm: m.vm, procs: m.procs, usage: m.usage }
             })
             .collect();
         (groups, any_rss)
@@ -492,6 +553,31 @@ mod tests {
         assert!(unit("/lxc/web") == lxc);
         let vm = Some(Unit::Named { kind: "machine", name: "qemu-1-ubuntu".into() });
         assert!(unit("/machine.slice/machine-qemu\\x2d1\\x2dubuntu.scope/libvirt") == vm);
+    }
+
+    #[test]
+    fn qemu_names() {
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let name = |s: &str| qemu_name(&argv(s));
+        assert_eq!(name("/usr/bin/qemu-system-x86_64 -S -name gbandit-vm -uuid 312c").as_deref(), Some("gbandit-vm"));
+        assert_eq!(name("qemu-system-aarch64 -name vm1,process=qemu-vm1").as_deref(), Some("vm1"));
+        assert_eq!(name("/usr/bin/qemu-kvm -name guest=ubuntu,debug-threads=on").as_deref(), Some("ubuntu"));
+        assert!(name("qemu-system-x86_64 -m 4G").is_none());
+        assert!(name("nvim -name foo").is_none());
+    }
+
+    #[test]
+    fn vm_launcher_from_cgroup() {
+        let launcher = |cg| match vm(cg, "x".into()).unit {
+            Unit::Vm { launcher, .. } => launcher,
+            _ => unreachable!(),
+        };
+        assert_eq!(launcher(Some("/system.slice/incus.service")), "incus");
+        assert_eq!(launcher(Some("/system.slice/snap.lxd.daemon.service")), "lxd");
+        assert_eq!(launcher(Some("/user.slice/user-1000.slice/session-2.scope")), "qemu");
+        assert_eq!(libvirt_guest("qemu-1-ubuntu"), Some("ubuntu"));
+        assert_eq!(libvirt_guest("qemu-12-my-vm"), Some("my-vm"));
+        assert!(libvirt_guest("debian-nspawn").is_none());
     }
 
     #[test]
