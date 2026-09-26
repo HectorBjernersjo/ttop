@@ -1,8 +1,10 @@
 //! ttop — vad äter min maskin, per tmux-session.
 //!
 //! Grupperar alla processer per tmux-session (sessioner sorterade på total
-//! förbrukning), och inom varje session per processtyp. Processer utanför
-//! tmux hamnar i en egen hink. Default beskärs outputen till det som
+//! förbrukning), och inom varje session per processtyp. Containrar,
+//! maskiner och Kubernetes utanför tmux samlas i en egen hink, en rad per
+//! container eller kluster (se containers.rs). Övriga processer hamnar i
+//! en hink för allt utanför tmux. Default beskärs outputen till det som
 //! faktiskt förklarar förbrukningen; `--all` visar allt.
 //!
 //! Mått: minne (default) eller CPU (`--cpu`). Ett mått i taget, för hela
@@ -30,6 +32,8 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod containers;
+
 /// println! som avslutar tyst när läsaren stängt pipen (`ttop | head`),
 /// istället för att panika.
 macro_rules! out {
@@ -45,9 +49,12 @@ macro_rules! out {
 }
 
 const OUTSIDE: &str = "[utanför tmux]";
+const CONTAINERS: &str = "[containrar]";
 const ZRAM: &str = "[zram]";
 const ZSWAP: &str = "[zswap]";
 const BAR_WIDTH: usize = 20;
+// Längre namn kortas, så att ett långt klusternamn inte breddar hela tabellen.
+const NAME_MAX: usize = 40;
 // Rader visas vid >= 1 % av sessionens förbrukning; sessioner vid >= 2 % av
 // totalen — en session ska förtjäna sin plats mer än en enskild rad.
 const ROW_MIN_PERCENT: u64 = 1;
@@ -81,6 +88,7 @@ struct Proc {
     pss: bool,
     cpu_ticks: u64, // utime + stime
     tmux_pane_env: Option<String>, // "%194"
+    cgroup: Option<String>,
 }
 
 #[derive(Default)]
@@ -148,7 +156,7 @@ fn main() {
             "-c" | "--cpu" => metric = Metric::Cpu,
             "-m" | "--mem" => metric = Metric::Mem,
             "-h" | "--help" => {
-                out!("ttop [--mem|--cpu] [--all]\n  --mem  minne (RAM + swap) per tmux-session (default)\n  --cpu  CPU per tmux-session, samplat under en sekund\n  --all  visa alla rader och sessioner");
+                out!("ttop [--mem|--cpu] [--all]\n  --mem  minne (RAM + swap) per tmux-session (default)\n  --cpu  CPU per tmux-session, samplat under en sekund\n  containrar, VM:ar och Kubernetes utanför tmux visas en rad per container eller kluster\n  --all  visa alla rader och sessioner");
                 return;
             }
             _ => {
@@ -170,17 +178,38 @@ fn main() {
 
     // session -> processtyp -> (antal, förbrukning)
     let mut by_session: HashMap<String, HashMap<String, (u32, Usage)>> = HashMap::new();
+    let mut containers = containers::Collector::default();
     let mut any_rss_fallback = false;
     for p in &procs {
         let usage = match metric {
             Metric::Mem => Usage { value: p.ram + p.swap, ram: p.ram, swap: p.swap },
             Metric::Cpu => Usage { value: p.cpu_ticks, ..Default::default() },
         };
+        let member = p.cgroup.as_deref().and_then(containers::classify);
         if usage.value == 0 {
-            continue; // kärntrådar, sovande processer m.m.
+            // Kärntrådar, sovande processer m.m. En sovande pod ska ändå
+            // räknas i sitt klusters antal pods.
+            if let Some(m) = member {
+                containers.seen(m);
+            }
+            continue;
         }
+        // tmux vinner över containern: kör tmux själv i en container
+        // (distrobox, toolbox) ska sessionerna ändå synas som sessioner.
+        let session = match (session_of(p, &ppid, &pane_pid_to_session, &pane_id_to_session), member) {
+            (Some(s), m) => {
+                if let Some(m) = m {
+                    containers.mark_in_tmux(m);
+                }
+                s
+            }
+            (None, Some(m)) => {
+                containers.add(m, &usage, p.pss);
+                continue;
+            }
+            (None, None) => OUTSIDE.to_string(),
+        };
         any_rss_fallback |= !p.pss;
-        let session = session_of(p, &ppid, &pane_pid_to_session, &pane_id_to_session);
         let e = by_session
             .entry(session)
             .or_default()
@@ -188,6 +217,11 @@ fn main() {
             .or_default();
         e.0 += 1;
         e.1.add(&usage);
+    }
+    let (groups, groups_rss) = containers.groups(metric == Metric::Mem);
+    any_rss_fallback |= groups_rss;
+    for g in groups {
+        by_session.entry(CONTAINERS.to_string()).or_default().insert(g.name, (g.procs, g.usage));
     }
     let swaps = read_swaps();
     let zswap = read_zswap();
@@ -255,7 +289,7 @@ fn main() {
         .chain(sys.iter().map(|r| r.name.chars().count()))
         .max()
         .unwrap_or(0)
-        .max(22);
+        .clamp(22, NAME_MAX);
     let t = Table { metric, name_w, grand: grand.value, paint };
     let procs_in = |rows: &[Row]| rows.iter().map(|r| r.count).sum::<u32>();
 
@@ -279,8 +313,10 @@ fn main() {
         }
         if k < s.rows.len() {
             let rest = &s.rows[k..];
+            // Processrader är processtyper; containerrader är redan en per enhet.
+            let what = if s.name == CONTAINERS { "till" } else { "typer till" };
             t.row(
-                &format!("  … {} typer till", rest.len()),
+                &format!("  … {} {what}", rest.len()),
                 procs_in(rest),
                 &sum(rest.iter().map(|r| &r.usage)),
                 Style::Dim,
@@ -326,6 +362,7 @@ struct Table {
 
 impl Table {
     fn text(&self, name: &str, count: &str, vals: &[String]) -> String {
+        let name = shorten(name, self.name_w);
         let mut s = format!("{name:<w$} {count:>5}", w = self.name_w);
         for v in vals {
             s += &format!(" {v:>VAL_W$}");
@@ -434,6 +471,20 @@ impl Table {
     }
 }
 
+/// Kortar till `w` tecken med "…". Det som står efter " · " (antal pods,
+/// containrar) behålls, så att det är själva namnet som kortas.
+fn shorten(name: &str, w: usize) -> String {
+    if name.chars().count() <= w {
+        return name.to_string();
+    }
+    let (head, tail) = match name.rfind(" · ") {
+        Some(i) => (&name[..i], &name[i..]),
+        None => (name, ""),
+    };
+    let keep = w.saturating_sub(tail.chars().count() + 1);
+    format!("{}…{tail}", head.chars().take(keep).collect::<String>())
+}
+
 /// Hur full en resurs är; färgen varnar när den närmar sig full.
 fn fill_bar(pct: u64, paint: Paint) -> String {
     let filled = ((pct as usize * BAR_WIDTH + 50) / 100).clamp(usize::from(pct > 0), BAR_WIDTH);
@@ -504,6 +555,7 @@ fn read_procs(metric: Metric) -> Vec<Proc> {
             pss,
             cpu_ticks: 0,
             tmux_pane_env: tmux_pane_from_environ(&base),
+            cgroup: containers::cgroup_path(pid),
         });
     }
     out
@@ -685,12 +737,12 @@ fn session_of(
     ppid: &HashMap<u32, u32>,
     by_pane_pid: &HashMap<u32, String>,
     by_pane_id: &HashMap<String, String>,
-) -> String {
+) -> Option<String> {
     // Förälderkedjan: pid, förälder, farförälder ... tills en pane-pid.
     let mut cur = p.pid;
     for _ in 0..128 {
         if let Some(sess) = by_pane_pid.get(&cur) {
-            return sess.clone();
+            return Some(sess.clone());
         }
         match ppid.get(&cur) {
             Some(&parent) if parent > 1 => cur = parent,
@@ -698,10 +750,7 @@ fn session_of(
         }
     }
     // Föräldralös: TMUX_PANE i environ pekar ut panen som startade den.
-    if let Some(sess) = p.tmux_pane_env.as_ref().and_then(|id| by_pane_id.get(id)) {
-        return sess.clone();
-    }
-    OUTSIDE.to_string()
+    p.tmux_pane_env.as_ref().and_then(|id| by_pane_id.get(id)).cloned()
 }
 
 struct SysRow {
@@ -770,5 +819,17 @@ fn human(bytes: u64) -> String {
         format!("{v:.1} {}", UNITS[unit])
     } else {
         format!("{v:.0} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shorten;
+
+    #[test]
+    fn shorten_keeps_the_count_suffix() {
+        assert_eq!(shorten("k3d abc · 3 pods", 40), "k3d abc · 3 pods");
+        assert_eq!(shorten("k3d gbandit-gba-95-thin-pool-monitor · 28 pods", 30), "k3d gbandit-gba-95-… · 28 pods");
+        assert_eq!(shorten("abcdefgh", 5), "abcd…");
     }
 }
