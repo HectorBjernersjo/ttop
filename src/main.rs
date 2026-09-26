@@ -30,6 +30,20 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// println! som avslutar tyst när läsaren stängt pipen (`ttop | head`),
+/// istället för att panika.
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        if let Err(e) = writeln!(std::io::stdout(), $($arg)*) {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                std::process::exit(0);
+            }
+            panic!("kunde inte skriva till stdout: {e}");
+        }
+    }};
+}
+
 const OUTSIDE: &str = "[utanför tmux]";
 const ZRAM: &str = "[zram]";
 const ZSWAP: &str = "[zswap]";
@@ -134,7 +148,7 @@ fn main() {
             "-c" | "--cpu" => metric = Metric::Cpu,
             "-m" | "--mem" => metric = Metric::Mem,
             "-h" | "--help" => {
-                println!("ttop [--mem|--cpu] [--all]\n  --mem  minne (RAM + swap) per tmux-session (default)\n  --cpu  CPU per tmux-session, samplat under en sekund\n  --all  visa alla rader och sessioner");
+                out!("ttop [--mem|--cpu] [--all]\n  --mem  minne (RAM + swap) per tmux-session (default)\n  --cpu  CPU per tmux-session, samplat under en sekund\n  --all  visa alla rader och sessioner");
                 return;
             }
             _ => {
@@ -147,7 +161,7 @@ fn main() {
         on: std::io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
     };
 
-    let mut procs = read_procs();
+    let mut procs = read_procs(metric);
     if metric == Metric::Cpu {
         sample_cpu(&mut procs);
     }
@@ -257,7 +271,7 @@ fn main() {
         );
     }
     for (s, &k) in sessions[..n_show].iter().zip(&visible).rev() {
-        println!();
+        out!();
         t.row(&s.name, procs_in(&s.rows), &s.total, Style::Head);
         // Rader fallande: sessionens största process direkt under rubriken.
         for r in &s.rows[..k] {
@@ -276,7 +290,7 @@ fn main() {
     t.rule();
     t.row("totalt", sessions.iter().map(|s| procs_in(&s.rows)).sum(), &grand, Style::Head);
     if metric == Metric::Mem && any_rss_fallback {
-        println!(
+        out!(
             "{}",
             paint.w(
                 Paint::DIM,
@@ -285,7 +299,7 @@ fn main() {
         );
     }
 
-    println!();
+    out!();
     match metric {
         Metric::Mem => t.system(&sys),
         Metric::Cpu => print_cpu_header(grand.value, paint),
@@ -321,20 +335,20 @@ impl Table {
     fn header(&self) {
         let (cols, legend) = match self.metric {
             Metric::Mem => (
-                vec!["RAM", "swap", "summa"],
+                vec!["summa", "RAM", "swap"],
                 format!("{} RAM  {} swap", self.paint.w(Paint::CYAN, "█"), self.paint.w(Paint::MAGENTA, "▓")),
             ),
             Metric::Cpu => (vec!["CPU"], String::new()),
         };
         let cols: Vec<String> = cols.into_iter().map(String::from).collect();
         let head = format!("{}  {legend}", self.paint.w(Paint::DIM, &self.text("", "antal", &cols)));
-        println!("{}", head.trim_end());
+        out!("{}", head.trim_end());
     }
 
     fn rule(&self) {
         let n_vals = if self.metric == Metric::Mem { 3 } else { 1 };
         let w = self.name_w + 6 + n_vals * (VAL_W + 1) + 2 + BAR_WIDTH + 5;
-        println!("{}", self.paint.w(Paint::DIM, &"─".repeat(w)));
+        out!("{}", self.paint.w(Paint::DIM, &"─".repeat(w)));
     }
 
     /// count 0 lämnar antal tomt, t.ex. för zram som inte är en process.
@@ -342,9 +356,9 @@ impl Table {
         let count = if count == 0 { String::new() } else { count.to_string() };
         let vals = match self.metric {
             Metric::Mem => vec![
+                human(u.value),
                 human(u.ram),
                 if u.swap == 0 { "–".to_string() } else { human(u.swap) },
-                human(u.value),
             ],
             Metric::Cpu => vec![self.metric.fmt(u.value)],
         };
@@ -356,10 +370,10 @@ impl Table {
         };
         let pct = if self.grand > 0 { u.value * 100 / self.grand } else { 0 };
         if pct == 0 && style != Style::Head {
-            println!("{}", format!("{text}  {}", self.share_bar(u, style, false)).trim_end());
+            out!("{}", format!("{text}  {}", self.share_bar(u, style, false)).trim_end());
         } else {
             let bar = self.share_bar(u, style, true);
-            println!("{text}  {bar} {}", self.paint.w(Paint::DIM, &format!("{pct:>3}%")));
+            out!("{text}  {bar} {}", self.paint.w(Paint::DIM, &format!("{pct:>3}%")));
         }
     }
 
@@ -405,12 +419,12 @@ impl Table {
     /// RAM och swap-enheterna, i samma kolumner som tabellen ovanför.
     fn system(&self, rows: &[SysRow]) {
         let cols: Vec<String> = ["använt", "totalt", "kvar"].map(String::from).to_vec();
-        println!("{}", self.paint.w(Paint::DIM, &self.text("", "", &cols)));
+        out!("{}", self.paint.w(Paint::DIM, &self.text("", "", &cols)));
         for r in rows {
             let pct = if r.size > 0 { r.used * 100 / r.size } else { 0 };
             let free = r.size.saturating_sub(r.used);
             let text = self.text(&r.name, "", &[human(r.used), human(r.size), human(free)]);
-            println!(
+            out!(
                 "{}  {} {}  {}",
                 self.paint.w(Paint::BOLD, &text),
                 fill_bar(pct, self.paint),
@@ -452,7 +466,8 @@ fn visible_row_count(rows: &[Row], total: u64, all: bool) -> usize {
     k
 }
 
-fn read_procs() -> Vec<Proc> {
+/// Minnet läses bara för Mem: smaps_rollup för alla processer är det dyra.
+fn read_procs(metric: Metric) -> Vec<Proc> {
     let mut out = Vec::new();
     let Ok(dir) = fs::read_dir("/proc") else { return out };
     for entry in dir.flatten() {
@@ -474,9 +489,12 @@ fn read_procs() -> Vec<Proc> {
                 _ => {}
             }
         }
-        let ((ram_kb, swap_kb), pss) = match pss_kb(&base) {
-            Some(v) => (v, true),
-            None => ((rss_kb, swap_kb), false),
+        let ((ram_kb, swap_kb), pss) = match metric {
+            Metric::Cpu => ((0, 0), true),
+            Metric::Mem => match pss_kb(&base) {
+                Some(v) => (v, true),
+                None => ((rss_kb, swap_kb), false),
+            },
         };
         out.push(Proc {
             pid,
@@ -485,21 +503,27 @@ fn read_procs() -> Vec<Proc> {
             ram: ram_kb * 1024,
             swap: swap_kb * 1024,
             pss,
-            cpu_ticks: cpu_ticks(pid).unwrap_or(0),
+            cpu_ticks: 0,
             tmux_pane_env: tmux_pane_from_environ(&base),
         });
     }
     out
 }
 
-/// Byt cpu_ticks från ackumulerat till förbrukning under CPU_SAMPLE, uttryckt
-/// i hundradels procent av en kärna. Processer som dött under tiden får 0.
+/// Sätt cpu_ticks till förbrukning under CPU_SAMPLE, uttryckt i hundradels
+/// procent av en kärna. Båda avläsningarna görs här, tätt runt sömnen, så att
+/// ttops eget arbete med att läsa /proc inte hamnar i mätfönstret.
+/// Processer som dött under tiden får 0.
 fn sample_cpu(procs: &mut [Proc]) {
+    let before: Vec<Option<u64>> = procs.iter().map(|p| cpu_ticks(p.pid)).collect();
     let start = Instant::now();
     thread::sleep(CPU_SAMPLE);
     let elapsed = start.elapsed().as_secs_f64();
-    for p in procs {
-        let delta = cpu_ticks(p.pid).unwrap_or(p.cpu_ticks).saturating_sub(p.cpu_ticks);
+    for (p, before) in procs.iter_mut().zip(before) {
+        let delta = match (before, cpu_ticks(p.pid)) {
+            (Some(a), Some(b)) => b.saturating_sub(a),
+            _ => 0,
+        };
         p.cpu_ticks = (delta as f64 / CLK_TCK as f64 / elapsed * 10_000.0).round() as u64;
     }
 }
@@ -732,7 +756,7 @@ fn print_cpu_header(grand: u64, paint: Paint) {
         Metric::Cpu.fmt(grand),
         cores * 100,
     );
-    println!("{}", paint.w(Paint::DIM, &line));
+    out!("{}", paint.w(Paint::DIM, &line));
 }
 
 fn human(bytes: u64) -> String {
