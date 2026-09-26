@@ -42,9 +42,12 @@ _corc                                 13    2.7 GB    459 MB    2.2 GB      7.0%
 - **Session:** en process hör till den tmux-session vars pane finns i dess
   förälderkedja. Föräldralösa daemons fångas via `TMUX_PANE` i processens
   environment.
-- **Containrar:** Docker, VM:ar och Kubernetes utanför tmux samlas under
-  `[containrar]`, en rad per container eller kluster. Resten hamnar i
-  `[utanför tmux]`.
+- **Containrar:** Docker, LXC och Kubernetes utanför tmux samlas under
+  `[containrar]`, en rad per container eller kluster.
+- **VM:ar:** qemu-maskiner (Incus, LXD, libvirt eller fristående) utanför
+  tmux samlas under `[VM:ar]`, en rad per VM med namnet ur `-name`. Inuti
+  en tmux-session blir de `qemu <namn>` istället för en gemensam rad.
+- Resten hamnar i `[utanför tmux]`.
 - **Minne:** PSS och SwapPss ur `/proc/<pid>/smaps_rollup`, så delat minne
   räknas proportionellt och summorna går ihop. zram och zswap visas som egna
   rader.
