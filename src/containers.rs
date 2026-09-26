@@ -10,6 +10,10 @@
 //! smaps kräver att man äger processen, och containerprocesser kör oftast som
 //! andra användare, så alternativet vore RSS som dubbelräknar delat minne.
 //! Utan cgroup v2 summeras processerna som för allt annat.
+//!
+//! CPU likaså: cgroupens usage_usec, avläst i början och slutet av
+//! mätfönstret, räknar även processer som hann avslutas däremellan
+//! (Kubernetes probes, korta exec). En processumma missar dem.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -57,7 +61,7 @@ pub enum Unit {
 pub struct Membership {
     pub unit: Unit,
     /// Enhetens cgroup, relativ CGROUP_ROOT.
-    dir: String,
+    pub dir: String,
     pod: Option<String>,
     /// Kubernetes-distribution, när processen hör till kontrollplanets tjänst.
     distro: Option<&'static str>,
@@ -249,8 +253,9 @@ impl Collector {
     }
 
     /// En rad per container, men containrar i samma kluster eller
-    /// compose-projekt slås ihop. Andra värdet: någon rad bygger på RSS.
-    pub fn groups(self, mem: bool) -> (Vec<Group>, bool) {
+    /// compose-projekt slås ihop. `cgroup_cpu` är CPU per cgroup-katalog
+    /// under mätfönstret. Andra värdet: någon rad bygger på RSS.
+    pub fn groups(self, cgroup_cpu: &HashMap<String, u64>) -> (Vec<Group>, bool) {
         let runtimes: HashSet<Runtime> = self
             .units
             .keys()
@@ -271,13 +276,19 @@ impl Collector {
         let mut merged: HashMap<String, Merged> = HashMap::new();
         let mut any_rss = false;
         for (unit, acc) in self.units {
-            let from_cgroup = (mem && cgroup_v2 && !acc.shared_with_tmux)
-                .then(|| cgroup_usage(&acc.dirs))
-                .flatten();
-            let usage = from_cgroup.unwrap_or_else(|| {
-                any_rss |= mem && acc.rss_fallback;
-                acc.fallback
-            });
+            let exact = cgroup_v2 && !acc.shared_with_tmux;
+            let mut usage = match exact.then(|| cgroup_mem(&acc.dirs)).flatten() {
+                Some((ram, swap)) => Usage { ram, swap, ..Default::default() },
+                None => {
+                    any_rss |= acc.rss_fallback;
+                    Usage { ram: acc.fallback.ram, swap: acc.fallback.swap, ..Default::default() }
+                }
+            };
+            // Alla kataloger måste ha mätts, annars blir summan för låg.
+            usage.cpu = exact
+                .then(|| acc.dirs.iter().map(|d| cgroup_cpu.get(d)).sum::<Option<u64>>())
+                .flatten()
+                .unwrap_or(acc.fallback.cpu);
             let name = match &unit {
                 Unit::Kube => acc.distro.unwrap_or("kubernetes").to_string(),
                 Unit::Named { kind, name } => format!("{kind} {name}"),
@@ -319,8 +330,8 @@ impl Collector {
 /// RAM = anon + fil-mappat, som motsvarar PSS: det processerna har i RAM,
 /// men inte page cache. Summan över flera kataloger förutsätter att ingen
 /// ligger under en annan, vilket classify garanterar (yttersta träffen).
-fn cgroup_usage(dirs: &HashSet<String>) -> Option<Usage> {
-    let mut u = Usage::default();
+fn cgroup_mem(dirs: &HashSet<String>) -> Option<(u64, u64)> {
+    let (mut ram, mut swap) = (0, 0);
     for d in dirs {
         let base = Path::new(CGROUP_ROOT).join(d);
         let stat = fs::read_to_string(base.join("memory.stat")).ok()?;
@@ -330,15 +341,20 @@ fn cgroup_usage(dirs: &HashSet<String>) -> Option<Usage> {
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(0)
         };
-        u.ram += field("anon") + field("file_mapped");
+        ram += field("anon") + field("file_mapped");
         // Saknas när swap-accounting är avslaget; då finns inget att räkna.
-        u.swap += fs::read_to_string(base.join("memory.swap.current"))
+        swap += fs::read_to_string(base.join("memory.swap.current"))
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(0);
     }
-    u.value = u.ram + u.swap;
-    Some(u)
+    Some((ram, swap))
+}
+
+/// Total CPU-tid för en cgroup och allt under den, i mikrosekunder (v2).
+pub fn cpu_usec(dir: &str) -> Option<u64> {
+    let stat = fs::read_to_string(Path::new(CGROUP_ROOT).join(dir).join("cpu.stat")).ok()?;
+    stat.lines().find_map(|l| l.strip_prefix("usage_usec ")?.trim().parse().ok())
 }
 
 struct Info {
