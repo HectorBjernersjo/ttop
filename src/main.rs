@@ -288,7 +288,7 @@ fn main() {
         }
     }
     t.rule();
-    t.row("totalt", sessions.iter().map(|s| procs_in(&s.rows)).sum(), &grand, Style::Head);
+    t.row("totalt", sessions.iter().map(|s| procs_in(&s.rows)).sum(), &grand, Style::Total);
     if metric == Metric::Mem && any_rss_fallback {
         out!(
             "{}",
@@ -311,6 +311,7 @@ const VAL_W: usize = 9;
 #[derive(Clone, Copy, PartialEq)]
 enum Style {
     Head,
+    Total, // som Head, men utan andel: den är alltid 100 %
     Normal,
     Dim,
 }
@@ -364,12 +365,12 @@ impl Table {
         };
         let text = self.text(name, &count, &vals);
         let text = match style {
-            Style::Head => self.paint.w(Paint::BOLD, &text),
+            Style::Head | Style::Total => self.paint.w(Paint::BOLD, &text),
             Style::Normal => text,
             Style::Dim => self.paint.w(Paint::DIM, &text),
         };
         let pct = if self.grand > 0 { u.value * 100 / self.grand } else { 0 };
-        if pct == 0 && style != Style::Head {
+        if pct == 0 || style == Style::Total {
             out!("{}", format!("{text}  {}", self.share_bar(u, style, false)).trim_end());
         } else {
             let bar = self.share_bar(u, style, true);
@@ -405,9 +406,7 @@ impl Table {
         let full = if self.metric == Metric::Mem { "▓" } else { "█" };
         let tail = format!("{}{}", full.repeat(rest / 8), PARTIAL[rest % 8]);
         let used = ram + tail.chars().count();
-        // Bakgrund bara på sessionsrader; på processrader blir det brus.
-        let empty = if style == Style::Head { "░" } else { " " };
-        let empty = if pad { empty.repeat(BAR_WIDTH - used) } else { String::new() };
+        let empty = if pad { " ".repeat(BAR_WIDTH - used) } else { String::new() };
         format!(
             "{}{}{}",
             self.paint.w(ram_c, &"█".repeat(ram)),
