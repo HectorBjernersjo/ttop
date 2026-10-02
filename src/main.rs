@@ -47,14 +47,14 @@ macro_rules! out {
             if e.kind() == std::io::ErrorKind::BrokenPipe {
                 std::process::exit(0);
             }
-            panic!("kunde inte skriva till stdout: {e}");
+            panic!("could not write to stdout: {e}");
         }
     }};
 }
 
-const OUTSIDE: &str = "[utanför tmux]";
-const CONTAINERS: &str = "[containrar]";
-const VMS: &str = "[VM:ar]";
+const OUTSIDE: &str = "[outside tmux]";
+const CONTAINERS: &str = "[containers]";
+const VMS: &str = "[VMs]";
 const ZRAM: &str = "[zram]";
 const ZSWAP: &str = "[zswap]";
 const BAR_WIDTH: usize = 20;
@@ -187,11 +187,11 @@ fn main() {
             "-c" | "--cpu" => sort = Metric::Cpu,
             "-m" | "--mem" => sort = Metric::Mem,
             "-h" | "--help" => {
-                out!("ttop [--mem|--cpu] [--all]\n  minne (RAM + swap) och CPU per tmux-session; CPU mäts under minst en sekund\n  containrar, VM:ar och Kubernetes utanför tmux visas en rad per container, VM eller kluster\n  --mem  sortera på minne (default)\n  --cpu  sortera på CPU\n  --all  visa alla rader och sessioner");
+                out!("ttop [--mem|--cpu] [--all]\n  memory (RAM + swap) and CPU per tmux session; CPU is sampled for at least one second\n  containers, VMs and Kubernetes outside tmux get one row per container, VM or cluster\n  --mem  sort by memory (default)\n  --cpu  sort by CPU\n  --all  show every row and session");
                 return;
             }
             _ => {
-                eprintln!("okänd flagga: {a}");
+                eprintln!("unknown flag: {a}");
                 std::process::exit(2);
             }
         }
@@ -327,7 +327,7 @@ fn main() {
     if n_show < sessions.len() {
         let rest = &sessions[n_show..];
         t.row(
-            &format!("… {} sessioner till", rest.len()),
+            &format!("… {} more sessions", rest.len()),
             rest.iter().map(|s| procs_in(&s.rows)).sum(),
             &sum(rest.iter().map(|s| &s.total)),
             Style::Dim,
@@ -343,7 +343,7 @@ fn main() {
         if k < s.rows.len() {
             let rest = &s.rows[k..];
             // Processrader är processtyper; container- och VM-rader är redan en per enhet.
-            let what = if s.name == CONTAINERS || s.name == VMS { "till" } else { "typer till" };
+            let what = if s.name == CONTAINERS || s.name == VMS { "more" } else { "more types" };
             t.row(
                 &format!("  … {} {what}", rest.len()),
                 procs_in(rest),
@@ -353,13 +353,13 @@ fn main() {
         }
     }
     t.rule();
-    t.row("totalt", sessions.iter().map(|s| procs_in(&s.rows)).sum(), &grand, Style::Total);
+    t.row("total", sessions.iter().map(|s| procs_in(&s.rows)).sum(), &grand, Style::Total);
     if any_rss_fallback {
         out!(
             "{}",
             paint.w(
                 Paint::DIM,
-                "(vissa processer kunde inte läsas som PSS; RSS/VmSwap använt, kan överdriva delat minne)",
+                "(some processes could not be read as PSS; RSS/VmSwap used instead, may overcount shared memory)",
             )
         );
     }
@@ -404,8 +404,8 @@ impl Table {
             Metric::Mem => format!("{} RAM  {} swap", self.paint.w(Paint::CYAN, "█"), self.paint.w(Paint::MAGENTA, "▓")),
             Metric::Cpu => format!("{} CPU", self.paint.w(Paint::BLUE, "█")),
         };
-        let cols = ["summa", "RAM", "swap", "CPU"].map(String::from);
-        let head = format!("{}  {legend}", self.paint.w(Paint::DIM, &self.text("", "antal", &cols)));
+        let cols = ["total", "RAM", "swap", "CPU"].map(String::from);
+        let head = format!("{}  {legend}", self.paint.w(Paint::DIM, &self.text("", "procs", &cols)));
         out!("{}", head.trim_end());
     }
 
@@ -461,7 +461,7 @@ impl Table {
     /// RAM, swap-enheterna och CPU, i samma kolumner som tabellen ovanför,
     /// så att fyllnadsstaplarna hamnar under andelsstaplarna.
     fn system(&self, rows: &[SysRow]) {
-        let cols = ["använt", "totalt", "kvar", "%"].map(String::from);
+        let cols = ["used", "total", "free", "%"].map(String::from);
         out!("{}", self.paint.w(Paint::DIM, &self.text("", "", &cols)));
         for r in rows {
             let pct = if r.size > 0 { r.used * 100 / r.size } else { 0 };
@@ -861,13 +861,13 @@ fn system_rows(grand: &Usage, swaps: &[SwapDev], zswap: Option<&Zswap>, sample: 
     let total = b("MemTotal:");
     let avail = b("MemAvailable:");
     let kernel_ram = swaps.iter().filter_map(|d| d.zram_ram).sum::<u64>() + zswap.map_or(0, |z| z.ram);
-    let compressed = |data: u64, ram: u64| format!("{:.1}× komprimerat", data as f64 / ram as f64);
+    let compressed = |data: u64, ram: u64| format!("{:.1}× compressed", data as f64 / ram as f64);
     let mut rows = vec![SysRow {
         name: "RAM".to_string(),
         used: total - avail,
         size: total,
         fmt: human,
-        note: format!("cache {} · processer {}", human(b("Cached:")), human(grand.ram - kernel_ram)),
+        note: format!("cache {} · processes {}", human(b("Cached:")), human(grand.ram - kernel_ram)),
     }];
     if let Some(z) = zswap {
         let ratio = if z.ram > 0 { format!(" ({})", compressed(z.data, z.ram)) } else { String::new() };
@@ -876,12 +876,12 @@ fn system_rows(grand: &Usage, swaps: &[SwapDev], zswap: Option<&Zswap>, sample: 
             used: z.ram,
             size: z.limit,
             fmt: human,
-            note: format!("{} data{ratio} · ingår i swap-enheternas använt", human(z.data)),
+            note: format!("{} data{ratio} · counted in the swap devices' used", human(z.data)),
         });
     }
     for d in swaps {
         let note = match d.zram_ram {
-            Some(ram) if ram > 0 => format!("zram, tar {} RAM ({})", human(ram), compressed(d.used, ram)),
+            Some(ram) if ram > 0 => format!("zram, uses {} RAM ({})", human(ram), compressed(d.used, ram)),
             Some(_) => "zram".to_string(),
             None => "disk".to_string(),
         };
@@ -897,7 +897,7 @@ fn system_rows(grand: &Usage, swaps: &[SwapDev], zswap: Option<&Zswap>, sample: 
             size: sample.cores * 10_000,
             fmt: cpu,
             note: format!(
-                "processer {} · {} kärnor · load {load} · mätt {:.1} s",
+                "processes {} · {} cores · load {load} · sampled {:.1} s",
                 cpu(grand.cpu),
                 sample.cores,
                 sample.secs
